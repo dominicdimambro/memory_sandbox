@@ -39,6 +39,39 @@ public:
         size_ += to_write;
         return to_write;
     }
+
+    // {function} write_overwrite: write n items into ring buffer with "drop-old" behavior
+    // {param} const T* in: pointer to the start of the input data to write
+    // {param} size_t n: requested number of elements to write
+    // {return} const size_t written: number of elements successfully written
+    size_t write_overwrite(const T* in, size_t n) {
+        if (cap_ == 0 || n == 0) return 0;
+
+        // if n >= capacity, keep only last cap_ elements
+        if (n >= cap_) {
+            // drop everything in the buffer
+            r_ = 0;
+            w_ = 0;
+            size_ = 0;
+
+            // write in the last cap_ elements from input data
+            const T* tail = in + (n - cap_);
+            // use normal write behavior since this will fit
+            return write(tail, cap_);
+        }
+
+        // drop old elements if we need to make room
+        const size_t needed = n;
+        if (needed > free_space()) {
+            const size_t overflow = needed - free_space();
+            // advance read head; reduces size
+            drop(overflow);
+        }
+
+        // now that it fits, write n elements
+        const size_t written = write(in, n);
+        return written;
+    }
     
     // {function} read: read up to n items from ring buffer
     // {param} *out: pointer to the start of data to read
