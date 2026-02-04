@@ -17,6 +17,10 @@ public:
     bool empty() const { return size_ == 0; }   
     bool full() const { return size_ == cap_; }
 
+    // Debug helpers
+    size_t write_pos() const { return w_; }
+    size_t read_pos() const { return r_; } 
+
     // {function} write: write up to n items into the ring buffer
     // {param} *in: pointer to the start of input data to write
     // {param} n: requested number of elements to write
@@ -28,6 +32,7 @@ public:
         // first chunk: from w_ to end
         const size_t first_chunk_size = std::min(to_write, cap_ - w_);
         std::copy(in, in + first_chunk_size, buf_.begin() + w_);
+
         // second chunk: from 0
         const size_t second_chunk_size = to_write - first_chunk_size;
         if (second_chunk_size > 0) {
@@ -110,6 +115,57 @@ public:
     // {function} clear: set size to 0, reset read/write heads to beginning
     void clear() {
         r_ = w_ = size_ = 0;
+    }
+
+    // ----------------------------
+    // Non-destructive read methods
+    // ----------------------------
+
+    // {function}: copy 'n' items ending at (write_pos - delay). Does NOT modify r_/w_/size_.
+    // if buffer has fewer than n valid items, copies what it has and returns that count.
+    // {param} T* out: pointer to start of data to read
+    // {param} size_t n: number of items to read
+    // {param} size_t delay: how far back from write head to copy items from (0 = newest written sample)
+    // {return}: number of items copied
+    size_t copy_latest(T* out, size_t n, size_t delay = 0) const {
+        if (cap_ == 0 || n == 0 || size_ == 0) return 0;
+
+        // limit what we can read: valid sample history ends size_ backwards from write head w_
+        const size_t can_read = std::min(n, size_);
+
+        // oldest valid sample is size_ before w_
+        const size_t max_delay = size_ > 0 ? (size_ - 1) : 0;
+        if (delay > max_delay) delay = max_delay;
+
+        // our copy region excludes emd: [start:end)
+        size_t end = (w_ + cap_ - (delay % cap_)) % cap_;
+
+        // start = end - can_read
+        size_t start = (end + cap_ - (can_read % cap_)) % cap_;
+
+        return copy_range(out, start, can_read);
+    }
+
+    // {function}: copy 'n' items starting at absolute ring index 'start' (0..cap-1)
+    // {param} T* out: pointer to start of data to read
+    // {param} size_t n: number of items to read
+    // return: number of items copied
+    size_t copy_range(T* out, size_t start, size_t n) const {
+        if (cap_ == 0 || n == 0 || size_ == 0) return 0;
+
+        const size_t to_copy = std::min(n, size_);
+        const size_t s = start % cap_;
+
+        // copy first chunk from s to end of buffer
+        const size_t first_chunk_size = std::min(to_copy, cap_ - s);
+        std::copy(buf_.begin() + s, buf_.begin() + s + first_chunk_size, out);
+
+        // if there is more to copy, finish in this chunk
+        const size_t second_chunk_size = to_copy - first;
+        if (second_chunk_size > 0) {
+            std::copy(buf_.begin(), buf_.begin() + second_chunk_size, out + first);
+        }
+        return to_copy;
     }
 
 private:
