@@ -130,18 +130,18 @@ public:
     size_t copy_latest(T* out, size_t n, size_t delay = 0) const {
         if (cap_ == 0 || n == 0 || size_ == 0) return 0;
 
-        // limit what we can read: valid sample history ends size_ backwards from write head w_
-        const size_t can_read = std::min(n, size_);
+        // delay can't go beyond oldest valid sample
+        if (delay >- size_) delay = size_ - 1;
 
-        // oldest valid sample is size_ before w_
-        const size_t max_delay = size_ > 0 ? (size_ - 1) : 0;
-        if (delay > max_delay) delay = max_delay;
+        // limit what we can read: valid sample history ends size_ backwards from write head w_
+        const size_t avail = size_ - delay;
+        const size_t can_read = std::min(n, avail);
 
         // our copy region excludes emd: [start:end)
-        size_t end = (w_ + cap_ - (delay % cap_)) % cap_;
+        size_t end = (w_ + cap_ - delay) % cap_;
 
         // start = end - can_read
-        size_t start = (end + cap_ - (can_read % cap_)) % cap_;
+        size_t start = (end + cap_ - can_read) % cap_;
 
         return copy_range(out, start, can_read);
     }
@@ -161,9 +161,9 @@ public:
         std::copy(buf_.begin() + s, buf_.begin() + s + first_chunk_size, out);
 
         // if there is more to copy, finish in this chunk
-        const size_t second_chunk_size = to_copy - first;
+        const size_t second_chunk_size = to_copy - first_chunk_size;
         if (second_chunk_size > 0) {
-            std::copy(buf_.begin(), buf_.begin() + second_chunk_size, out + first);
+            std::copy(buf_.begin(), buf_.begin() + second_chunk_size, out + first_chunk_size);
         }
         return to_copy;
     }
