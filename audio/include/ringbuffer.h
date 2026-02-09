@@ -131,7 +131,7 @@ public:
         if (cap_ == 0 || n == 0 || size_ == 0) return 0;
 
         // delay can't go beyond oldest valid sample
-        if (delay >- size_) delay = size_ - 1;
+        if (delay >= size_) delay = size_ - 1;
 
         // limit what we can read: valid sample history ends size_ backwards from write head w_
         const size_t avail = size_ - delay;

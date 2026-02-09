@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
                     } else {
                         const size_t cap = rb.capacity();
                         const size_t w = rb.write_pos();
-                        loop_read_pos = (w + cap - (loop_len % cap)) % cap;
+                        loop_start = (w + cap - (loop_len % cap)) % cap;
                         loop_read_pos = loop_start;
                     }
                 }
