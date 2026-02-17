@@ -26,7 +26,7 @@ class OnsetSlicer : public Slicer {
 public:
     float sensitivity = 1.0f;
     int pre_onset_ms = 10;
-    int slice_ms = 200;
+    int slice_ms = 1000;
     int min_slice_ms = 30;
 
     std::vector<SliceRegion> process(
