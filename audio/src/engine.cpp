@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "alsa_util.h"
@@ -16,6 +17,25 @@
 #include "terminal.h"
 
 static std::atomic<bool> g_run{true};
+
+// Returns cumulative CPU time (user + sys) for this process in clock ticks.
+// Reads /proc/self/stat; fields 14+15 (utime, stime) follow the comm field.
+static uint64_t read_cpu_ticks() {
+    FILE* f = fopen("/proc/self/stat", "r");
+    if (!f) return 0;
+    char buf[512];
+    bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+    fclose(f);
+    if (!ok) return 0;
+    const char* p = strrchr(buf, ')');  // comm ends at last ')'
+    if (!p) return 0;
+    p += 2;  // skip ') '
+    unsigned long utime = 0, stime = 0;
+    // after comm: state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime
+    sscanf(p, "%*c %*d %*d %*d %*d %*d %*lu %*lu %*lu %*lu %*lu %lu %lu",
+           &utime, &stime);
+    return (uint64_t)(utime + stime);
+}
 
 int main(int argc, char** argv) {
 
@@ -59,6 +79,9 @@ int main(int argc, char** argv) {
         "   1-6 = grain interval (1s/200ms/100ms/50ms/30ms/15ms)\n"
         "   , / . = decrease / increase grain length (25ms steps, 20-2000ms)\n"
         "   [ / ] = decrease / increase onset sensitivity\n"
+        "   - / = = envelope shape: percussive -> sustained -> swell\n"
+        "   p = toggle passthrough (dry signal mixed with grains)\n"
+        "   9 / 0 = decrease / increase dry/wet (0=all dry  1=all grains)\n"
         "   q = quit\n"
     );
 
@@ -82,6 +105,16 @@ int main(int argc, char** argv) {
     std::atomic<int> grain_length_ms{200};
     std::atomic<bool> explicit_mode{false};
     std::atomic<int> current_grain_id{-1};
+    // 0.0=percussive  1.0=sustained  2.0=swell  (interpolated between 3 presets)
+    std::atomic<float> env_pos{1.0f};
+    std::atomic<bool> passthrough_enabled{false};
+    std::atomic<float> dry_wet{1.0f};  // 0.0=all dry (passthrough)  1.0=all grains (wet)
+
+
+    // passthrough ring buffer: small, always written by capture thread
+    const size_t pt_rb_capacity = samples_per_period * 8;
+    RingBuffer<int16_t> pt_rb(pt_rb_capacity);
+    std::mutex pt_rb_mtx;
 
     // ---- capture thread ----
     std::thread cap_thread([&] {
@@ -105,9 +138,16 @@ int main(int argc, char** argv) {
             }
             was_recording = rec;
 
+            const size_t nsamp = (size_t)n * channels;
+
+            // always feed passthrough buffer regardless of record state
+            {
+                std::lock_guard<std::mutex> lk(pt_rb_mtx);
+                pt_rb.write_overwrite(in.data(), nsamp);
+            }
+
             if (!rec) continue;
 
-            const size_t nsamp = (size_t)n * channels;
             {
                 std::lock_guard<std::mutex> lk(rb_mtx);
                 rb.write_overwrite(in.data(), nsamp);
@@ -167,11 +207,33 @@ int main(int argc, char** argv) {
     // ---- playback thread ----
     std::thread pb_thread([&] {
         std::vector<int16_t> out(samples_per_period, 0);
+        std::vector<int32_t> mix(samples_per_period, 0);
+        std::vector<int16_t> pt_buf(samples_per_period, 0);
 
-        Slice cur{};
-        bool cur_valid = false;
-        uint32_t pos = 0;
-        int grain_jitter_ms = 0;
+        // voice pool for overlapping grain playback
+        const int MAX_VOICES = 20;
+        struct GrainVoice {
+            Slice slice;
+            uint32_t pos;
+            uint32_t play_end;
+            bool active;
+            float attack_frac;  // fraction of play_end spent in attack ramp
+            float decay_frac;   // fraction of play_end spent in decay ramp
+        };
+        GrainVoice voices[MAX_VOICES] = {};
+
+        // envelope shape presets: {attack_frac, decay_frac}
+        // shape 0 (percussive): short attack, long decay ramp
+        // shape 1 (sustained):  short attack, sustain plateau, short decay
+        // shape 2 (swell):      long attack ramp, short decay
+        struct EnvPreset { float attack; float decay; };
+        const EnvPreset kEnvShapes[3] = {
+            {0.05f, 0.95f},
+            {0.10f, 0.10f},
+            {0.85f, 0.15f},
+        };
+        int next_voice = 0;
+
         uint32_t rng = 0x12345678u;
 
         auto next_switch = std::chrono::steady_clock::now();
@@ -184,6 +246,7 @@ int main(int argc, char** argv) {
             bool expl    = explicit_mode.load(std::memory_order_relaxed);
             int interval = grain_interval_ms.load(std::memory_order_relaxed);
             int glen_ms  = grain_length_ms.load(std::memory_order_relaxed);
+            float env_p  = env_pos.load(std::memory_order_relaxed);
 
             if (!playing) {
                 got = 0;
@@ -199,7 +262,7 @@ int main(int argc, char** argv) {
                 }
             }
             else {
-                // grains mode: random slice playback
+                // grains mode: overlapping random slice playback
                 auto now = std::chrono::steady_clock::now();
                 if (now >= next_switch) {
                     rng = xorshift32(rng);
@@ -207,54 +270,98 @@ int main(int argc, char** argv) {
                     if (store.random_id(rng, new_id)) {
                         Slice tmp;
                         if (store.get(new_id, tmp)) {
-                            cur = tmp;
-                            cur_valid = true;
-                            pos = 0;
-                            current_grain_id.store(new_id, std::memory_order_relaxed);
-
                             // per-grain jitter: ±25% of glen_ms at grain start
                             rng = xorshift32(rng);
                             int jitter_range = glen_ms / 4;
-                            grain_jitter_ms = (jitter_range > 0)
+                            int jitter_ms = (jitter_range > 0)
                                 ? (int)(rng % (2 * jitter_range + 1)) - jitter_range
                                 : 0;
+                            int actual_ms = std::max(20, glen_ms + jitter_ms);
+                            uint32_t play_end = std::min(
+                                (uint32_t)((uint64_t)rate * channels * actual_ms / 1000),
+                                tmp.length);
+
+                            // interpolate envelope shape between the three presets
+                            float ep = std::max(0.0f, std::min(2.0f, env_p));
+                            int   lo = (int)ep;
+                            int   hi = std::min(lo + 1, 2);
+                            float t  = ep - (float)lo;
+                            float att = kEnvShapes[lo].attack * (1.0f - t) + kEnvShapes[hi].attack * t;
+                            float dec = kEnvShapes[lo].decay  * (1.0f - t) + kEnvShapes[hi].decay  * t;
+
+                            // round-robin voice allocation (overwrites oldest if all busy)
+                            GrainVoice& v = voices[next_voice % MAX_VOICES];
+                            v.slice       = tmp;
+                            v.pos         = 0;
+                            v.play_end    = play_end;
+                            v.active      = true;
+                            v.attack_frac = att;
+                            v.decay_frac  = dec;
+                            next_voice++;
+                            current_grain_id.store(new_id, std::memory_order_relaxed);
 
                             if (expl) {
                                 std::fprintf(stderr, "[grain] id=%d slice_samples=%u jitter=%dms interval=%dms\n",
-                                    cur.id, cur.length, grain_jitter_ms, interval);
+                                    tmp.id, tmp.length, jitter_ms, interval);
                             }
                         }
-                    } else {
-                        cur_valid = false;
                     }
                     next_switch = now + std::chrono::milliseconds(interval);
                 }
 
-                if (cur_valid) {
-                    int actual_ms = std::max(20, glen_ms + grain_jitter_ms);
-                    uint32_t play_end = std::min(
-                        (uint32_t)((uint64_t)rate * channels * actual_ms / 1000),
-                        cur.length);
-                    uint32_t remain = (pos < play_end) ? (play_end - pos) : 0;
-                    uint32_t want = (uint32_t)samples_per_period;
-                    uint32_t take = std::min(remain, want);
-
-                    if (take > 0) {
-                        std::lock_guard<std::mutex> lk(store.mtx);
-                        const int16_t* base = store.corpus.data() + cur.corpus_start;
-                        std::copy(base + pos, base + pos + take, out.begin());
-
-                        got = take;
-                        pos += take;
-                    } else {
-                        got = 0;
-                        cur_valid = false;
+                // mix all active voices into int32 accumulator, then clamp to int16
+                std::fill(mix.begin(), mix.end(), 0);
+                {
+                    std::lock_guard<std::mutex> lk(store.mtx);
+                    for (auto& v : voices) {
+                        if (!v.active) continue;
+                        uint32_t remain = (v.pos < v.play_end) ? (v.play_end - v.pos) : 0;
+                        uint32_t take = std::min(remain, (uint32_t)samples_per_period);
+                        if (take > 0) {
+                            const int16_t* base = store.corpus.data() + v.slice.corpus_start;
+                            for (uint32_t i = 0; i < take; i++) {
+                                float grain_t = (float)(v.pos + i) / (float)v.play_end;
+                                float env;
+                                if (grain_t < v.attack_frac) {
+                                    env = grain_t / v.attack_frac;
+                                } else if (grain_t > 1.0f - v.decay_frac) {
+                                    env = (1.0f - grain_t) / v.decay_frac;
+                                } else {
+                                    env = 1.0f;
+                                }
+                                mix[i] += (int32_t)((float)base[v.pos + i] * env);
+                            }
+                            v.pos += take;
+                        }
+                        if (v.pos >= v.play_end) v.active = false;
                     }
                 }
+                for (size_t i = 0; i < samples_per_period; i++) {
+                    int32_t s = mix[i];
+                    out[i] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
+                }
+                got = samples_per_period;
             }
 
             if (got < samples_per_period) {
                 std::fill(out.begin() + got, out.end(), 0);
+            }
+
+            // passthrough: crossfade dry (live) and wet (grains)
+            // dry_wet: 0.0=all dry  1.0=all grains
+            if (passthrough_enabled.load(std::memory_order_relaxed)) {
+                float dw = dry_wet.load(std::memory_order_relaxed);
+                size_t pt_got = 0;
+                {
+                    std::lock_guard<std::mutex> lk(pt_rb_mtx);
+                    pt_got = pt_rb.copy_latest(pt_buf.data(), samples_per_period, samples_per_period * 2);
+                }
+                for (size_t i = 0; i < samples_per_period; i++) {
+                    float dry_s = (i < pt_got) ? (float)pt_buf[i] * (1.0f - dw) : 0.0f;
+                    float wet_s = (float)out[i] * dw;
+                    int32_t s = (int32_t)(dry_s + wet_s);
+                    out[i] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
+                }
             }
 
             snd_pcm_sframes_t w = snd_pcm_writei(pb, out.data(), period_frames);
@@ -263,6 +370,9 @@ int main(int argc, char** argv) {
     });
 
     // ---- key input loop ----
+    auto last_stats_time  = std::chrono::steady_clock::now();
+    uint64_t last_cpu_ticks = read_cpu_ticks();
+
     while (g_run.load(std::memory_order_relaxed)) {
         int k = read_key_nonblocking();
 
@@ -299,6 +409,12 @@ int main(int argc, char** argv) {
                 store.list();
             }
 
+            else if (k == 'p') {
+                bool v = !passthrough_enabled.load();
+                passthrough_enabled.store(v);
+                std::fprintf(stderr, "[key] passthrough = %s\n", v ? "on" : "off");
+            }
+
             else if (k == '.') {
                 int v = std::min(grain_length_ms.load() + 25, slicer->slice_ms);
                 grain_length_ms.store(v);
@@ -320,12 +436,58 @@ int main(int argc, char** argv) {
                 slicer_sensitivity.store(v);
                 std::fprintf(stderr, "[key] sensitivity=%.1f\n", v);
             }
+            else if (k == '=') {
+                float v = std::min(env_pos.load() + 0.25f, 2.0f);
+                env_pos.store(v);
+                const char* name = (v < 0.75f) ? "percussive" : (v < 1.25f) ? "sustained" : (v < 1.75f) ? "->swell" : "swell";
+                std::fprintf(stderr, "[key] env_shape=%.2f (%s)\n", v, name);
+            }
+            else if (k == '-') {
+                float v = std::max(env_pos.load() - 0.25f, 0.0f);
+                env_pos.store(v);
+                const char* name = (v < 0.25f) ? "percussive" : (v < 0.75f) ? "->sustained" : (v < 1.25f) ? "sustained" : "->swell";
+                std::fprintf(stderr, "[key] env_shape=%.2f (%s)\n", v, name);
+            }
+
+            else if (k == '9') {
+                float v = std::max(dry_wet.load() - 0.1f, 0.0f);
+                dry_wet.store(v);
+                std::fprintf(stderr, "[key] dry_wet=%.1f (%s)\n", v, v < 0.15f ? "all dry" : v > 0.85f ? "all grains" : "mix");
+            }
+            else if (k == '0') {
+                float v = std::min(dry_wet.load() + 0.1f, 1.0f);
+                dry_wet.store(v);
+                std::fprintf(stderr, "[key] dry_wet=%.1f (%s)\n", v, v < 0.15f ? "all dry" : v > 0.85f ? "all grains" : "mix");
+            }
+
             else if (k == '1') { grain_interval_ms.store(1000); std::fprintf(stderr, "[key] interval=1000ms\n"); }
             else if (k == '2') { grain_interval_ms.store(200);  std::fprintf(stderr, "[key] interval=200ms\n"); }
             else if (k == '3') { grain_interval_ms.store(100);  std::fprintf(stderr, "[key] interval=100ms\n"); }
             else if (k == '4') { grain_interval_ms.store(50);   std::fprintf(stderr, "[key] interval=50ms\n"); }
             else if (k == '5') { grain_interval_ms.store(30);   std::fprintf(stderr, "[key] interval=30ms\n"); }
             else if (k == '6') { grain_interval_ms.store(15);   std::fprintf(stderr, "[key] interval=15ms\n"); }
+        }
+
+        // periodic stats: cpu usage + corpus size every 5 seconds
+        {
+            auto now_s = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now_s - last_stats_time).count();
+            if (elapsed >= 5.0) {
+                uint64_t ticks = read_cpu_ticks();
+                double cpu_pct = ((double)(ticks - last_cpu_ticks) / (double)sysconf(_SC_CLK_TCK))
+                                 / elapsed * 100.0;
+                size_t corpus_samples, n_slices;
+                {
+                    std::lock_guard<std::mutex> lk(store.mtx);
+                    corpus_samples = store.corpus.size();
+                    n_slices       = store.slices.size();
+                }
+                std::fprintf(stderr, "[stats] cpu=%.1f%%  corpus=%zu slices / %zu samples (%.1f KB)\n",
+                    cpu_pct, n_slices, corpus_samples,
+                    corpus_samples * sizeof(int16_t) / 1024.0);
+                last_stats_time = now_s;
+                last_cpu_ticks  = ticks;
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

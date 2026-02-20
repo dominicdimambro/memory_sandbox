@@ -63,9 +63,6 @@ std::vector<OnsetEvent> detect_onsets_stereo_s16(
         }
     }
 
-    std::fprintf(stderr, "[onset] max_d=%.6f level_thresh=%.6f delta_thresh=%.6f\n",
-                 max_d, level_thresh, delta_thresh);
-
     return events;
 }
 
@@ -81,8 +78,6 @@ std::vector<SliceRegion> OnsetSlicer::process(
     const size_t min_frames = (size_t)rate * min_slice_ms / 1000;
 
     auto events = detect_onsets_stereo_s16(data, n_samples, channels, rate, sensitivity);
-
-    std::fprintf(stderr, "[slicer] onsets=%zu\n", events.size());
 
     std::vector<SliceRegion> regions;
     regions.reserve(events.size());
