@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "grain_pipeline.h"
+
 inline uint32_t xorshift32(uint32_t& s) {
     s ^= s << 13;
     s ^= s >> 17;
@@ -17,6 +19,7 @@ struct Slice {
     int id;
     uint64_t corpus_start;  // sample index in corpus buffer
     uint32_t length;        // length of slice in samples
+    SliceFeatures features;
 };
 
 struct SliceStore {
@@ -25,12 +28,12 @@ struct SliceStore {
     std::unordered_map<int, Slice> slices;
     int next_id = 0;
 
-    int add_slice(const int16_t* data, uint32_t n_samples) {
+    int add_slice(const int16_t* data, uint32_t n_samples, SliceFeatures features = {}) {
         std::lock_guard<std::mutex> lk(mtx);
         uint64_t start = corpus.size();
         corpus.insert(corpus.end(), data, data + n_samples);
         int id = next_id++;
-        slices[id] = Slice{id, start, n_samples};
+        slices[id] = Slice{id, start, n_samples, features};
         return id;
     }
 
@@ -38,8 +41,13 @@ struct SliceStore {
         std::lock_guard<std::mutex> lk(mtx);
         std::fprintf(stderr, "Slices (%zu):\n", slices.size());
         for (auto& [id, s] : slices) {
-            std::fprintf(stderr, "  id=%d start=%llu lenSamples=%u\n",
-                         id, (unsigned long long)s.corpus_start, s.length);
+            std::fprintf(stderr,
+                "  id=%d start=%llu lenSamples=%u"
+                "  rms=%.4f f0=%.1fHz conf=%.2f flat=%.4f rolloff=%.1fHz tonal=%.4f\n",
+                id, (unsigned long long)s.corpus_start, s.length,
+                s.features.rms, s.features.f0, s.features.pitch_confidence,
+                s.features.spectral_flatness, s.features.rolloff_freq,
+                s.features.tonal_alignment_score);
         }
     }
 
@@ -61,6 +69,7 @@ struct SliceStore {
         out_id = it->first;
         return true;
     }
+
 
     const int16_t* ptr(uint64_t corpusIndex) const {
         return corpus.data() + corpusIndex;

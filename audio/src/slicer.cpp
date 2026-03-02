@@ -79,8 +79,8 @@ std::vector<SliceRegion> OnsetSlicer::process(
 
     auto events = detect_onsets_stereo_s16(data, n_samples, channels, rate, sensitivity);
 
-    std::vector<SliceRegion> regions;
-    regions.reserve(events.size());
+    std::vector<SliceRegion> slice_candidates;
+    slice_candidates.reserve(events.size());
 
     for (auto& o : events) {
         size_t onset_frame = (size_t)o.sample_index;
@@ -94,8 +94,8 @@ std::vector<SliceRegion> OnsetSlicer::process(
 
         if (n_frames_slice < min_frames) continue;
 
-        regions.push_back(SliceRegion{start_frame, n_frames_slice});
+        slice_candidates.push_back(SliceRegion{start_frame, n_frames_slice});
     }
 
-    return regions;
+    return slice_candidates;
 }

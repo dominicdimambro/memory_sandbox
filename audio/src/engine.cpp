@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "alsa_util.h"
+#include "grain_pipeline.h"
 #include "ringbuffer.h"
 #include "slice_store.h"
 #include "slicer.h"
@@ -90,6 +91,19 @@ int main(int argc, char** argv) {
 
     // slicer: swappable algorithm (default: onset detection)
     auto slicer = std::make_unique<OnsetSlicer>();
+
+    // grain pipeline stages
+    std::vector<std::unique_ptr<SlicePreprocessor>> preprocessors;
+    std::vector<std::unique_ptr<SliceAnalyzer>>     analyzers;
+    std::vector<std::unique_ptr<SliceFilter>>        filters;
+
+    // register preprocessors, analyzers, filters in the desired order
+    preprocessors.push_back(std::make_unique<StereoToMonoPreprocessor>());
+
+    analyzers.push_back(std::make_unique<RMSAnalyzer>());
+    analyzers.push_back(std::make_unique<F0Analyzer>());
+    analyzers.push_back(std::make_unique<SpectralFlatnessAnalyzer>());
+
 
     SliceStore store;
 
@@ -183,17 +197,62 @@ int main(int argc, char** argv) {
                         one_sec_window.data(), got, channels, rate
                     );
 
+                    // build initial candidate list from raw slice regions
+                    std::vector<SliceCandidate> slice_candidates;
+                    slice_candidates.reserve(regions.size());
                     for (auto& region : regions) {
-                        size_t start_sample = region.start_frame * channels;
-                        size_t n_samples_slice = region.length_frames * channels;
+                        slice_candidates.push_back(SliceCandidate{
+                            region,
+                            one_sec_window.data(),
+                            channels,
+                            rate,
+                            {} // features populated below
+                        });
+                    }
+
+                    // ---- preprocessing stage ----
+                    // each preprocessor may modify a candidate's region or discard it
+                    for (auto& pre : preprocessors) {
+                        std::vector<SliceCandidate> surviving;
+                        surviving.reserve(slice_candidates.size());
+                        for (auto& c : slice_candidates) {
+                            if (pre->process(c)) surviving.push_back(c);
+                        }
+                        slice_candidates = std::move(surviving);
+                    }
+
+                    // ---- feature analysis stage ----
+                    // each analyzer populates fields in candidate.features
+                    for (auto& c : slice_candidates) {
+                        for (auto& an : analyzers) {
+                            an->analyze(c);
+                        }
+                    }
+
+                    // ---- filter stage ----
+                    // discard candidates that fail any filter
+                    for (auto& filt : filters) {
+                        std::vector<SliceCandidate> surviving;
+                        surviving.reserve(slice_candidates.size());
+                        for (auto& c : slice_candidates) {
+                            if (filt->passes(c)) surviving.push_back(c);
+                        }
+                        slice_candidates = std::move(surviving);
+                    }
+
+                    // ---- commit surviving candidates to store ----
+                    for (auto& c : slice_candidates) {
+                        size_t start_sample = c.region.start_frame * channels;
+                        size_t n_samples_slice = c.region.length_frames * channels;
 
                         int id = store.add_slice(
-                            one_sec_window.data() + start_sample,
-                            (uint32_t)n_samples_slice
+                            c.window + start_sample,
+                            (uint32_t)n_samples_slice,
+                            c.features
                         );
 
                         std::fprintf(stderr, "[slice] id=%d start=%.1fms len=%zu samples\n",
-                            id, 1000.0 * region.start_frame / rate, n_samples_slice);
+                            id, 1000.0 * c.region.start_frame / rate, n_samples_slice);
                     }
                 }
 
@@ -211,7 +270,7 @@ int main(int argc, char** argv) {
         std::vector<int16_t> pt_buf(samples_per_period, 0);
 
         // voice pool for overlapping grain playback
-        const int MAX_VOICES = 20;
+        const int MAX_VOICES = 30;
         struct GrainVoice {
             Slice slice;
             uint32_t pos;
