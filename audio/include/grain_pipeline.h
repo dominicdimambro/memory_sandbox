@@ -31,6 +31,10 @@ struct SliceCandidate {
     // normalized [-1, 1] mono signal covering exactly region.length_frames frames;
     // populated by StereoToMonoPreprocessor — analyzers should prefer this over window when non-empty
     std::vector<float> mono_buf;
+
+    // Hann-windowed FFT power spectrum (kFFTSize/2 positive-frequency bins);
+    // populated lazily by ensure_power_spectrum() — shared across all spectral analyzers
+    std::vector<float> power_spectrum;
 };
 
 // ---- stage interfaces ----
@@ -81,6 +85,75 @@ public:
     }
 };
 
+// ---- shared spectrum helper ----
+
+static constexpr size_t kFFTSize = 1024;  // must be a power of 2
+static constexpr float  kPi      = 3.14159265358979f;
+
+// Computes and caches a Hann-windowed radix-2 FFT power spectrum in candidate.power_spectrum.
+// Returns a reference to the cached result (no-op on subsequent calls).
+// kFFTSize/2 bins; bin k -> frequency k * rate / kFFTSize Hz.
+// Returns an empty vector if the slice has fewer than 2 frames.
+inline const std::vector<float>& ensure_power_spectrum(SliceCandidate& candidate) {
+    if (!candidate.power_spectrum.empty()) return candidate.power_spectrum;
+
+    const float* x = candidate.mono_buf.empty() ? nullptr : candidate.mono_buf.data();
+    const int16_t* x_raw = candidate.window + candidate.region.start_frame * candidate.channels;
+    const size_t n = std::min(candidate.region.length_frames, kFFTSize);
+
+    if (n < 2) return candidate.power_spectrum;  // leave empty
+
+    // interleaved real/imag, zero-initialized (zero-pads to kFFTSize)
+    std::vector<float> buf(kFFTSize * 2, 0.0f);
+    for (size_t i = 0; i < n; i++) {
+        float hann = 0.5f * (1.0f - cosf(2.0f * kPi * i / (n - 1)));
+        float s = x ? x[i] : (x_raw[i * candidate.channels] / 32768.0f);
+        buf[i * 2] = s * hann;
+    }
+
+    // bit-reversal permutation
+    for (size_t i = 1, j = 0; i < kFFTSize; i++) {
+        size_t bit = kFFTSize >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            std::swap(buf[i * 2],     buf[j * 2]);
+            std::swap(buf[i * 2 + 1], buf[j * 2 + 1]);
+        }
+    }
+
+    // Cooley-Tukey radix-2 DIT butterfly stages
+    for (size_t len = 2; len <= kFFTSize; len <<= 1) {
+        float ang      = -2.0f * kPi / len;
+        float wre_step = cosf(ang), wim_step = sinf(ang);
+        for (size_t i = 0; i < kFFTSize; i += len) {
+            float wre = 1.0f, wim = 0.0f;
+            for (size_t k = 0; k < len / 2; k++) {
+                size_t u = (i + k) * 2, v = (i + k + len / 2) * 2;
+                float t_re = wre * buf[v] - wim * buf[v + 1];
+                float t_im = wre * buf[v + 1] + wim * buf[v];
+                buf[v]     = buf[u]     - t_re;
+                buf[v + 1] = buf[u + 1] - t_im;
+                buf[u]     += t_re;
+                buf[u + 1] += t_im;
+                float new_wre = wre * wre_step - wim * wim_step;
+                wim = wre * wim_step + wim * wre_step;
+                wre = new_wre;
+            }
+        }
+    }
+
+    // magnitude squared for positive-frequency bins
+    const size_t n_bins = kFFTSize / 2;
+    candidate.power_spectrum.resize(n_bins);
+    for (size_t k = 0; k < n_bins; k++) {
+        float re = buf[k * 2], im = buf[k * 2 + 1];
+        candidate.power_spectrum[k] = re * re + im * im;
+    }
+
+    return candidate.power_spectrum;
+}
+
 // ---- analyzer implementations ----
 
 // computes root mean square (RMS) amplitude of the slice; populates candidate.features.rms
@@ -88,7 +161,6 @@ public:
 class RMSAnalyzer : public SliceAnalyzer {
 public:
     void analyze(SliceCandidate& candidate) override {
-        // only operate on mono buffer if available, otherwise fall back to raw window
         const float* x = candidate.mono_buf.empty() ? nullptr : candidate.mono_buf.data();
         const int16_t* x_raw = candidate.window + candidate.region.start_frame * candidate.channels;
         size_t n_frames = candidate.region.length_frames;
@@ -115,10 +187,11 @@ public:
 class F0Analyzer : public SliceAnalyzer {
 public:
     void analyze(SliceCandidate& candidate) override {
-        // only operate on mono buffer if available, otherwise fall back to raw window
         const float* x = candidate.mono_buf.empty() ? nullptr : candidate.mono_buf.data();
         const int16_t* x_raw = candidate.window + candidate.region.start_frame * candidate.channels;
-        size_t n_frames = candidate.region.length_frames;
+        // cap to 2048 frames — pitch detection doesn't benefit from longer windows
+        // and the NSDF is O(n_frames * lag_range)
+        size_t n_frames = std::min(candidate.region.length_frames, (size_t)2048);
 
         // create instrument lag bounds based on expected pitch range
         float min_expected_f0 = 50.0f;
@@ -130,7 +203,7 @@ public:
         // find lag with maximum normalized autocorrelation
         float max_R = 0.0f;
         size_t best_lag = 0;
-        
+
         // NSDF (normalized square difference function): n[lag] = 2*sum(s1*s2) / (sum(s1^2) + sum(s2^2))
         // bounded [-1, 1]; arithmetic denominator avoids the low-lag bias of Pearson's sqrt(e1*e2)
         float eps = 1e-8f;
@@ -165,75 +238,53 @@ public:
     }
 };
 
-// computes spectral rolloff frequency (rolloff_freq) at rolloff_threshold energy; populates candidate.features.rolloff_freq
-// operates on candidate.mono_buf if available, otherwise falls back to candidate.window
-// uses a 1024-point Hann-windowed DFT; bin resolution = rate / 1024 (~46.9 Hz at 48kHz)
+// computes spectral rolloff frequency at rolloff_threshold energy; populates candidate.features.rolloff_freq
+// bin resolution = rate / kFFTSize (~46.9 Hz at 48kHz)
 class SpectralRolloffAnalyzer : public SliceAnalyzer {
 public:
     float rolloff_threshold = 0.85f;
 
     void analyze(SliceCandidate& candidate) override {
-        const float* x = candidate.mono_buf.empty() ? nullptr : candidate.mono_buf.data();
-        const int16_t* x_raw = candidate.window + candidate.region.start_frame * candidate.channels;
-        size_t n_frames = candidate.region.length_frames;
+        const auto& mag2 = ensure_power_spectrum(candidate);
+        if (mag2.empty()) { candidate.features.rolloff_freq = 0.0f; return; }
 
-        static constexpr float kPi = 3.14159265358979f;
-        const size_t N = 1024;
-        const size_t n = std::min(n_frames, N);
-        if (n < 2) { candidate.features.rolloff_freq = 0.0f; return; }
-
-        // apply Hann window to first n samples
-        std::vector<float> buf(n);
-        for (size_t i = 0; i < n; i++) {
-            float hann = 0.5f * (1.0f - cosf(2.0f * kPi * i / (n - 1)));
-            float s = x ? x[i] : (x_raw[i * candidate.channels] / 32768.0f);
-            buf[i] = s * hann;
-        }
-
-        // magnitude squared at each of the n/2 positive-frequency bins
-        const size_t n_bins = n / 2;
-        std::vector<float> mag2(n_bins);
         float total_energy = 0.0f;
-        for (size_t k = 0; k < n_bins; k++) {
-            float re = 0.0f, im = 0.0f;
-            const float phase_step = 2.0f * kPi * k / n;
-            for (size_t i = 0; i < n; i++) {
-                re += buf[i] * cosf(phase_step * i);
-                im -= buf[i] * sinf(phase_step * i);
-            }
-            mag2[k] = re * re + im * im;
-            total_energy += mag2[k];
-        }
-
+        for (float p : mag2) total_energy += p;
         if (total_energy < 1e-10f) { candidate.features.rolloff_freq = 0.0f; return; }
 
-        // find lowest bin where cumulative energy crosses rolloff_threshold
         float cumulative = 0.0f;
         const float threshold = rolloff_threshold * total_energy;
-        for (size_t k = 0; k < n_bins; k++) {
+        for (size_t k = 0; k < mag2.size(); k++) {
             cumulative += mag2[k];
             if (cumulative >= threshold) {
-                candidate.features.rolloff_freq = (float)k * candidate.rate / n;
+                candidate.features.rolloff_freq = (float)k * candidate.rate / kFFTSize;
                 return;
             }
         }
-        candidate.features.rolloff_freq = (float)(n_bins - 1) * candidate.rate / n;
+        candidate.features.rolloff_freq = (float)(mag2.size() - 1) * candidate.rate / kFFTSize;
     }
 };
 
-
-// computes spectral flatness of the slice; populates candidate.features.spectral_flatness
-// operates on candidate.mono_buf if available, otherwise falls back to candidate.window
+// computes spectral flatness (Wiener entropy) of the slice; populates candidate.features.spectral_flatness
+// result is in [0, 1]: 0 = pure tone, 1 = white noise
 class SpectralFlatnessAnalyzer : public SliceAnalyzer {
 public:
     void analyze(SliceCandidate& candidate) override {
-        // only operate on mono buffer if available, otherwise fall back to raw window
-        const float* x = candidate.mono_buf.empty() ? nullptr : candidate.mono_buf.data();
-        const int16_t* x_raw = candidate.window + candidate.region.start_frame * candidate.channels;
-        size_t n_frames = candidate.region.length_frames;
+        const auto& mag2 = ensure_power_spectrum(candidate);
+        if (mag2.empty()) { candidate.features.spectral_flatness = 0.0f; return; }
 
+        float log_sum = 0.0f;
+        float arith_sum = 0.0f;
+        const float eps = 1e-10f;
+        for (float p : mag2) {
+            log_sum   += logf(p + eps);
+            arith_sum += p;
+        }
 
+        float arith_mean = arith_sum / mag2.size();
+        if (arith_mean < eps) { candidate.features.spectral_flatness = 0.0f; return; }
 
+        float geo_mean = expf(log_sum / mag2.size());
+        candidate.features.spectral_flatness = geo_mean / arith_mean;
     }
-
 };

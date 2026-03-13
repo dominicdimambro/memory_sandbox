@@ -102,6 +102,7 @@ int main(int argc, char** argv) {
 
     analyzers.push_back(std::make_unique<RMSAnalyzer>());
     analyzers.push_back(std::make_unique<F0Analyzer>());
+    analyzers.push_back(std::make_unique<SpectralRolloffAnalyzer>());
     analyzers.push_back(std::make_unique<SpectralFlatnessAnalyzer>());
 
 
