@@ -83,6 +83,8 @@ int main(int argc, char** argv) {
         "   - / = = envelope shape: percussive -> sustained -> swell\n"
         "   p = toggle passthrough (dry signal mixed with grains)\n"
         "   9 / 0 = decrease / increase dry/wet (0=all dry  1=all grains)\n"
+        "   z / x = tonal root down / up (semitone, wraps A..Ab)\n"
+        "   v = toggle tonal scale (major / minor)\n"
         "   q = quit\n"
     );
 
@@ -100,10 +102,21 @@ int main(int argc, char** argv) {
     // register preprocessors, analyzers, filters in the desired order
     preprocessors.push_back(std::make_unique<StereoToMonoPreprocessor>());
 
+    static constexpr float kRootFreqs[12] = {
+        440.000f, 466.164f, 493.883f, 523.251f, 554.365f, 587.330f,
+        622.254f, 659.255f, 698.456f, 739.989f, 783.991f, 830.609f,
+    //  A         Bb        B         C         C#        D
+    //  Eb        E         F         F#        G         Ab
+    };
+
     analyzers.push_back(std::make_unique<RMSAnalyzer>());
     analyzers.push_back(std::make_unique<F0Analyzer>());
     analyzers.push_back(std::make_unique<SpectralRolloffAnalyzer>());
     analyzers.push_back(std::make_unique<SpectralFlatnessAnalyzer>());
+
+    auto tonal_ptr_own = std::make_unique<TonalAlignmentAnalyzer>();
+    TonalAlignmentAnalyzer* tonal_ptr = tonal_ptr_own.get();
+    analyzers.push_back(std::move(tonal_ptr_own));
 
 
     SliceStore store;
@@ -116,6 +129,11 @@ int main(int argc, char** argv) {
     std::atomic<float> slicer_sensitivity{1.0f};
 
     // playback controls
+    // tonal alignment controls
+    // root index: 0=A 1=Bb 2=B 3=C 4=C# 5=D 6=Eb 7=E 8=F 9=F# 10=G 11=Ab
+    std::atomic<int>  tonal_root_idx{0};   // default: A=440Hz
+    std::atomic<bool> tonal_minor{false};  // false=major, true=minor
+
     std::atomic<int> grain_interval_ms{1000};
     std::atomic<int> grain_length_ms{200};
     std::atomic<bool> explicit_mode{false};
@@ -194,6 +212,9 @@ int main(int argc, char** argv) {
 
                 if (got == rb_capacity_samples) {
                     slicer->sensitivity = slicer_sensitivity.load(std::memory_order_relaxed);
+                    tonal_ptr->root_idx   = tonal_root_idx.load(std::memory_order_relaxed);
+                    tonal_ptr->scale_type = tonal_minor.load(std::memory_order_relaxed)
+                                            ? ScaleType::Minor : ScaleType::Major;
                     auto regions = slicer->process(
                         one_sec_window.data(), got, channels, rate
                     );
@@ -518,6 +539,37 @@ int main(int argc, char** argv) {
                 float v = std::min(dry_wet.load() + 0.1f, 1.0f);
                 dry_wet.store(v);
                 std::fprintf(stderr, "[key] dry_wet=%.1f (%s)\n", v, v < 0.15f ? "all dry" : v > 0.85f ? "all grains" : "mix");
+            }
+
+            else if (k == 'z' || k == 'x') {
+                static const char* kNames[12] = {"A","Bb","B","C","C#","D","Eb","E","F","F#","G","Ab"};
+                int idx = (k == 'z')
+                    ? (tonal_root_idx.load() + 11) % 12   // step down
+                    : (tonal_root_idx.load() +  1) % 12;  // step up
+                tonal_root_idx.store(idx);
+                ScaleType sc = tonal_minor.load() ? ScaleType::Minor : ScaleType::Major;
+                {
+                    std::lock_guard<std::mutex> lk(store.mtx);
+                    for (auto& [id, slice] : store.slices)
+                        slice.features.tonal_alignment_score =
+                            TonalAlignmentAnalyzer::tonal_score_from_chroma(
+                                slice.features.chroma_energy, idx, sc);
+                }
+                std::fprintf(stderr, "[key] tonal root=%s (%.1fHz)\n", kNames[idx], kRootFreqs[idx]);
+            }
+            else if (k == 'v') {
+                bool minor = !tonal_minor.load();
+                tonal_minor.store(minor);
+                int idx = tonal_root_idx.load();
+                ScaleType sc = minor ? ScaleType::Minor : ScaleType::Major;
+                {
+                    std::lock_guard<std::mutex> lk(store.mtx);
+                    for (auto& [id, slice] : store.slices)
+                        slice.features.tonal_alignment_score =
+                            TonalAlignmentAnalyzer::tonal_score_from_chroma(
+                                slice.features.chroma_energy, idx, sc);
+                }
+                std::fprintf(stderr, "[key] tonal scale=%s\n", minor ? "minor" : "major");
             }
 
             else if (k == '1') { grain_interval_ms.store(1000); std::fprintf(stderr, "[key] interval=1000ms\n"); }

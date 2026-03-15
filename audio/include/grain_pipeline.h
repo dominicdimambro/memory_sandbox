@@ -16,6 +16,9 @@ struct SliceFeatures {
     float f0 = 0.0f;
     float pitch_confidence = 0.0f;
     float spectral_flatness = 0.0f;
+    // normalized per-pitch-class energy relative to A=440, root-independent;
+    // index 0=A 1=Bb ... 11=Ab; used to recompute tonal_alignment_score on root/scale change
+    float chroma_energy[12] = {};
 };
 
 // ---- candidate ----
@@ -287,4 +290,64 @@ public:
         float geo_mean = expf(log_sum / mag2.size());
         candidate.features.spectral_flatness = geo_mean / arith_mean;
     }
+};
+
+enum class ScaleType { Major, Minor };
+
+// computes tonal alignment score relative to a root note and scale
+// analyze() builds a root-independent normalized chroma vector (chroma_energy[12])
+// then projects it onto the current root/scale via tonal_score_from_chroma()
+// calling tonal_score_from_chroma() on stored slices after a root/scale change updates
+// tonal_alignment_score without re-running the FFT
+class TonalAlignmentAnalyzer : public SliceAnalyzer {
+public:
+    int       root_idx        = 0;              // 0=A 1=Bb ... 11=Ab; set from engine atomic each epoch
+    ScaleType scale_type      = ScaleType::Major;
+    float     low_freq_cutoff = 80.0f;
+
+    void analyze(SliceCandidate& candidate) override {
+        const auto& mag2 = ensure_power_spectrum(candidate);
+        if (mag2.empty()) { candidate.features.tonal_alignment_score = 0.0f; return; }
+
+        // accumulate energy per absolute pitch class relative to A=440 (root-independent)
+        float raw_chroma[12] = {};
+        float total_energy   = 0.0f;
+
+        for (size_t k = 0; k < mag2.size(); k++) {
+            float bin_freq = (float)k * candidate.rate / kFFTSize;
+            if (bin_freq < low_freq_cutoff) continue;
+            if (mag2[k] < 1e-12f) continue;
+
+            float raw_st = 12.0f * log2f(bin_freq / 440.0f);  // relative to A=440, not root
+            int sc = (int)roundf(raw_st) % 12;
+            if (sc < 0) sc += 12;
+
+            raw_chroma[sc] += mag2[k];
+            total_energy   += mag2[k];
+        }
+
+        if (total_energy < 1e-10f) { candidate.features.tonal_alignment_score = 0.0f; return; }
+
+        for (int i = 0; i < 12; i++)
+            candidate.features.chroma_energy[i] = raw_chroma[i] / total_energy;
+
+        candidate.features.tonal_alignment_score =
+            tonal_score_from_chroma(candidate.features.chroma_energy, root_idx, scale_type);
+    }
+
+    // project a stored chroma vector onto a root/scale; O(12) — call on all slices after root change
+    static float tonal_score_from_chroma(const float* chroma, int root_idx, ScaleType scale) {
+        const float* weights = (scale == ScaleType::Major) ? kMajorWeights : kMinorWeights;
+        float score = 0.0f;
+        for (int i = 0; i < 12; i++) {
+            int semitone_from_root = (i - root_idx + 12) % 12;
+            score += chroma[i] * weights[semitone_from_root];
+        }
+        return score;
+    }
+
+private:
+    // semitone weights [0..11]: unison, m2, M2, m3, M3, P4, tritone, P5, m6, M6, m7, M7
+    static constexpr float kMajorWeights[12] = { +1.0f, -0.5f, -0.1f, -0.2f, +0.6f, +0.4f, -0.8f, +0.9f, -0.2f, +0.5f, -0.3f, +0.2f };
+    static constexpr float kMinorWeights[12] = { +1.0f, -0.5f, -0.1f, +0.6f, -0.2f, +0.4f, -0.8f, +0.9f, +0.4f, -0.2f, +0.3f, -0.4f };
 };
