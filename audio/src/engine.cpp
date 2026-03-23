@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     const unsigned int rate = 48000;
     const unsigned int channels = 2;
     const snd_pcm_uframes_t period_frames = 256;
-    const snd_pcm_uframes_t buffer_frames = period_frames * 16;
+    const snd_pcm_uframes_t buffer_frames = period_frames * 4;
 
     const size_t samples_per_period = (size_t)period_frames * channels;
 
