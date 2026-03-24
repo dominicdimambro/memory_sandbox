@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +51,73 @@ struct SliceStore {
                 s.features.spectral_flatness, s.features.rolloff_freq,
                 s.features.tonal_alignment_score);
         }
+
+        if (slices.size() < 2) return;
+
+        // per-feature stats + ASCII histogram
+        static constexpr int kBuckets = 10;
+        struct FeatStat {
+            const char* name;
+            float min, max, sum;
+            int buckets[kBuckets];
+        };
+
+        FeatStat stats[] = {
+            {"rms    ", 1e9f, -1e9f, 0.f, {}},
+            {"flat   ", 1e9f, -1e9f, 0.f, {}},
+            {"tonal  ", 1e9f, -1e9f, 0.f, {}},
+            {"rolloff", 1e9f, -1e9f, 0.f, {}},
+            {"f0     ", 1e9f, -1e9f, 0.f, {}},
+        };
+
+        // first pass: min/max/sum
+        for (auto& [id, s] : slices) {
+            float vals[] = {
+                s.features.rms,
+                s.features.spectral_flatness,
+                s.features.tonal_alignment_score,
+                s.features.rolloff_freq,
+                s.features.f0,
+            };
+            for (int i = 0; i < 5; i++) {
+                if (vals[i] < stats[i].min) stats[i].min = vals[i];
+                if (vals[i] > stats[i].max) stats[i].max = vals[i];
+                stats[i].sum += vals[i];
+            }
+        }
+
+        // second pass: fill buckets
+        for (auto& [id, s] : slices) {
+            float vals[] = {
+                s.features.rms,
+                s.features.spectral_flatness,
+                s.features.tonal_alignment_score,
+                s.features.rolloff_freq,
+                s.features.f0,
+            };
+            for (int i = 0; i < 5; i++) {
+                float range = stats[i].max - stats[i].min;
+                if (range < 1e-12f) { stats[i].buckets[0]++; continue; }
+                int b = (int)((vals[i] - stats[i].min) / range * kBuckets);
+                if (b >= kBuckets) b = kBuckets - 1;
+                stats[i].buckets[b]++;
+            }
+        }
+
+        std::fprintf(stderr, "\n[feature stats]  (n=%zu)\n", slices.size());
+        for (int i = 0; i < 5; i++) {
+            float mean = stats[i].sum / (float)slices.size();
+            std::fprintf(stderr, "  %s  min=%-9.4f max=%-9.4f mean=%-9.4f  [",
+                stats[i].name, stats[i].min, stats[i].max, mean);
+            int peak = *std::max_element(stats[i].buckets, stats[i].buckets + kBuckets);
+            for (int b = 0; b < kBuckets; b++) {
+                int bar = (peak > 0) ? (stats[i].buckets[b] * 8 / peak) : 0;
+                const char* blocks[] = {" ","▁","▂","▃","▄","▅","▆","▇","█"};
+                std::fprintf(stderr, "%s", blocks[bar]);
+            }
+            std::fprintf(stderr, "]\n");
+        }
+        std::fprintf(stderr, "\n");
     }
 
     bool get(int id, Slice& out) {

@@ -16,6 +16,7 @@ struct SliceFeatures {
     float f0 = 0.0f;
     float pitch_confidence = 0.0f;
     float spectral_flatness = 0.0f;
+    float gain = 1.0f;  // set by GainNormalizerAnalyzer; applied at playback
     // normalized per-pitch-class energy relative to A=440, root-independent;
     // index 0=A 1=Bb ... 11=Ab; used to recompute tonal_alignment_score on root/scale change
     float chroma_energy[12] = {};
@@ -350,4 +351,24 @@ private:
     // semitone weights [0..11]: unison, m2, M2, m3, M3, P4, tritone, P5, m6, M6, m7, M7
     static constexpr float kMajorWeights[12] = { +1.0f, -0.5f, -0.1f, -0.2f, +0.6f, +0.4f, -0.8f, +0.9f, -0.2f, +0.5f, -0.3f, +0.2f };
     static constexpr float kMinorWeights[12] = { +1.0f, -0.5f, -0.1f, +0.6f, -0.2f, +0.4f, -0.8f, +0.9f, +0.4f, -0.2f, +0.3f, -0.4f };
+};
+
+// Computes a playback gain to normalise each grain toward target_rms.
+// Must be registered after RMSAnalyzer so features.rms is already populated.
+// gain is capped at max_gain to avoid over-amplifying near-silent grains.
+class GainNormalizerAnalyzer : public SliceAnalyzer {
+public:
+    float target_rms = 0.09f;  // target loudness (~median of observed corpus)
+    float max_gain   = 6.0f;   // hard ceiling: never boost more than 6×
+
+    void analyze(SliceCandidate& candidate) override {
+        float rms = candidate.features.rms;
+        if (rms < 1e-6f) {
+            candidate.features.gain = 1.0f;
+            return;
+        }
+        float g = target_rms / rms;
+        if (g > max_gain) g = max_gain;
+        candidate.features.gain = g;
+    }
 };

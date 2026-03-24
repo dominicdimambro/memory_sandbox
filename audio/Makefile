@@ -1,6 +1,8 @@
 CXX      := g++
-CXXFLAGS := -Iinclude
-LDFLAGS  := -lasound
+SDL2_CFLAGS := $(shell sdl2-config --cflags)
+SDL2_LIBS   := $(shell sdl2-config --libs)
+CXXFLAGS := -Iinclude $(SDL2_CFLAGS)
+LDFLAGS  := -lasound $(SDL2_LIBS)
 
 BUILDDIR := build
 
@@ -10,8 +12,8 @@ all: $(BUILDDIR)/engine
 
 HEADERS := $(wildcard include/*.h)
 
-$(BUILDDIR)/engine: src/alsa_util.cpp src/slicer.cpp src/engine.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) src/alsa_util.cpp src/slicer.cpp src/engine.cpp -o $@ $(LDFLAGS)
+$(BUILDDIR)/engine: src/alsa_util.cpp src/slicer.cpp src/engine.cpp src/grain_visualizer.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) src/alsa_util.cpp src/slicer.cpp src/engine.cpp src/grain_visualizer.cpp -o $@ $(LDFLAGS)
 
 # ---- unit tests (no ALSA) ----
 .PHONY: test

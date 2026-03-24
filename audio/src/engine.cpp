@@ -12,6 +12,7 @@
 
 #include "alsa_util.h"
 #include "grain_pipeline.h"
+#include "grain_visualizer.h"
 #include "ringbuffer.h"
 #include "slice_store.h"
 #include "slicer.h"
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
     };
 
     analyzers.push_back(std::make_unique<RMSAnalyzer>());
+    analyzers.push_back(std::make_unique<GainNormalizerAnalyzer>());
     analyzers.push_back(std::make_unique<F0Analyzer>());
     analyzers.push_back(std::make_unique<SpectralRolloffAnalyzer>());
     analyzers.push_back(std::make_unique<SpectralFlatnessAnalyzer>());
@@ -143,6 +145,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> passthrough_enabled{false};
     std::atomic<float> dry_wet{1.0f};  // 0.0=all dry (passthrough)  1.0=all grains (wet)
 
+    GrainVisualizer viz(store, g_run, current_grain_id);
 
     // passthrough ring buffer: small, always written by capture thread
     const size_t pt_rb_capacity = samples_per_period * 8;
@@ -410,7 +413,7 @@ int main(int argc, char** argv) {
                                 } else {
                                     env = 1.0f;
                                 }
-                                mix[i] += (int32_t)((float)base[v.pos + i] * env);
+                                mix[i] += (int32_t)((float)base[v.pos + i] * env * v.slice.features.gain);
                             }
                             v.pos += take;
                         }
@@ -449,6 +452,8 @@ int main(int argc, char** argv) {
             if (w < 0) recover_if_xrun(pb, (int)w, "playback");
         }
     });
+
+    viz.start();
 
     // ---- key input loop ----
     auto last_stats_time  = std::chrono::steady_clock::now();
@@ -607,6 +612,7 @@ int main(int argc, char** argv) {
 
     // shutdown
     g_run.store(false);
+    viz.stop();
     if (cap_thread.joinable()) cap_thread.join();
     if (pb_thread.joinable()) pb_thread.join();
     if (slicer_thread.joinable()) slicer_thread.join();
