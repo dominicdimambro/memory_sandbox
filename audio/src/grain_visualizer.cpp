@@ -114,19 +114,24 @@ void GrainVisualizer::snapshot() {
         p.id = id;
         // tonal: centred at 0 (neutral), ±1.0 maps to ±0.5 — stable across key changes
         p.x  = f.tonal_alignment_score * 0.5f;
-        // flatness: nearly all data in [0, 0.008]; sqrt-transform to spread the cluster
-        float flat_n = f.spectral_flatness / 0.008f;
-        if (flat_n > 1.0f) flat_n = 1.0f;
-        p.y  = std::sqrt(flat_n) - 0.5f;
-        // rms: observed [0.009, 0.164] → map full range to [-0.5, 0.5]
-        float rms_n = (f.rms - 0.009f) / 0.155f;
+        // rolloff: log scale maps 47 Hz→-0.5, ~750 Hz→0, 12 kHz→+0.5
+        {
+            const float log_min = 3.850f, log_max = 9.393f;
+            float lr = std::log(std::max(f.rolloff_freq, 47.f));
+            p.y = (lr - log_min) / (log_max - log_min) - 0.5f;
+            if (p.y > 0.5f) p.y = 0.5f;
+            if (p.y < -0.5f) p.y = -0.5f;
+        }
+        // rms: sqrt-scale so quiet corpora spread across the axis; cap at 0.12
+        float rms_n = std::sqrt(f.rms / 0.12f);
         if (rms_n > 1.0f) rms_n = 1.0f;
-        if (rms_n < 0.0f) rms_n = 0.0f;
-        p.z           = rms_n - 0.5f;
+        p.z = rms_n - 0.5f;
         p.rolloff_norm = f.rolloff_freq / 20000.0f;
         if (p.rolloff_norm > 1.0f) p.rolloff_norm = 1.0f;
         if (p.rolloff_norm < 0.0f) p.rolloff_norm = 0.0f;
-        p.rms_norm = rms_n;
+        // flatness: nearly all data in [0, 0.008]; sqrt-stretch then clamp to [0,1]
+        float flat_n = std::sqrt(f.spectral_flatness / 0.008f);
+        p.flatness_norm = flat_n > 1.0f ? 1.0f : flat_n;
         points_.push_back(p);
     }
 
@@ -199,8 +204,9 @@ void GrainVisualizer::render_frame() {
             SDL_RenderDrawRect(renderer_, &rect);
         } else {
             // hue: blue (low rolloff/bass) → red (high rolloff/bright)
+            // brightness: dim=pure tone (flatness≈0), bright=noisy (flatness≈1)
             float hue = (1.0f - p.rolloff_norm) * (240.0f / 360.0f);
-            float val = 0.5f + 0.5f * p.rms_norm;
+            float val = 0.3f + 0.7f * p.flatness_norm;
             SDL_Color col = hsv_to_rgb(hue, 0.9f, val);
             SDL_SetRenderDrawColor(renderer_, col.r, col.g, col.b, 255);
             if (zr > 0.1f) {

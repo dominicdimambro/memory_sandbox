@@ -10,8 +10,8 @@
 struct GrainPoint {
     int   id;
     float x, y, z;        // remapped to [-0.5, +0.5]
-    float rolloff_norm;    // for color (hue)
-    float rms_norm;        // for brightness
+    float rolloff_norm;    // for color (hue): blue=bass → red=bright
+    float flatness_norm;   // for brightness: dim=pure tone, bright=noisy
 };
 
 class GrainVisualizer {

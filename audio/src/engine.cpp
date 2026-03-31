@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     const unsigned int rate = 48000;
     const unsigned int channels = 2;
     const snd_pcm_uframes_t period_frames = 256;
-    const snd_pcm_uframes_t buffer_frames = period_frames * 4;
+    const snd_pcm_uframes_t buffer_frames = period_frames * 8;
 
     const size_t samples_per_period = (size_t)period_frames * channels;
 
@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
         "   9 / 0 = decrease / increase dry/wet (0=all dry  1=all grains)\n"
         "   z / x = tonal root down / up (semitone, wraps A..Ab)\n"
         "   v = toggle tonal scale (major / minor)\n"
+        "   k = cycle kNN k (1/3/5/10 nearest grains to live audio)\n"
         "   q = quit\n"
     );
 
@@ -145,6 +146,13 @@ int main(int argc, char** argv) {
     std::atomic<bool> passthrough_enabled{false};
     std::atomic<float> dry_wet{1.0f};  // 0.0=all dry (passthrough)  1.0=all grains (wet)
 
+    // kNN grain selection
+    std::atomic<int>   grain_k{5};          // k=1/3/5/10, cycled with 'k' key
+    std::atomic<float> live_tonal{0.f};
+    std::atomic<float> live_rolloff{500.f};
+    std::atomic<float> live_rms{0.05f};
+    std::atomic<bool>  live_valid{false};   // true once first valid (non-silent) analysis done
+
     GrainVisualizer viz(store, g_run, current_grain_id);
 
     // passthrough ring buffer: small, always written by capture thread
@@ -158,6 +166,17 @@ int main(int argc, char** argv) {
 
         uint64_t samples_since_epoch = 0;
         bool was_recording = false;
+
+        // live feature analysis: accumulates directly from capture into a local buffer,
+        // no mutex needed — only the capture thread reads/writes this
+        const size_t kLiveFrames  = kFFTSize;  // 1024 frames
+        const size_t kLiveSamples = kLiveFrames * channels;
+        std::vector<int16_t> live_buf(kLiveSamples, 0);
+        size_t live_fill = 0;
+        StereoToMonoPreprocessor live_s2m;
+        RMSAnalyzer              live_rms_an;
+        SpectralRolloffAnalyzer  live_rolloff_an;
+        TonalAlignmentAnalyzer   live_tonal_an;
 
         while (g_run.load(std::memory_order_relaxed)) {
             snd_pcm_sframes_t n = snd_pcm_readi(cap, in.data(), period_frames);
@@ -180,6 +199,38 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> lk(pt_rb_mtx);
                 pt_rb.write_overwrite(in.data(), nsamp);
+            }
+
+            // accumulate capture samples into live_buf; analyze when full
+            {
+                size_t to_copy = std::min(nsamp, kLiveSamples - live_fill);
+                std::memcpy(live_buf.data() + live_fill, in.data(), to_copy * sizeof(int16_t));
+                live_fill += to_copy;
+            }
+            if (live_fill >= kLiveSamples) {
+                live_fill = 0;
+                if (true) {
+                    SliceCandidate lc;
+                    lc.window   = live_buf.data();
+                    lc.channels = channels;
+                    lc.rate     = rate;
+                    lc.region   = {0, kLiveFrames};
+                    live_s2m.process(lc);
+                    live_rms_an.analyze(lc);
+                    // always update rms so silence gate in playback thread tracks current level
+                    live_rms.store(lc.features.rms, std::memory_order_relaxed);
+                    if (lc.features.rms >= 0.01f) {
+                        // only update tonal/rolloff when signal is present (meaningless on silence)
+                        live_rolloff_an.analyze(lc);
+                        live_tonal_an.root_idx   = tonal_root_idx.load(std::memory_order_relaxed);
+                        live_tonal_an.scale_type = tonal_minor.load(std::memory_order_relaxed)
+                                                    ? ScaleType::Minor : ScaleType::Major;
+                        live_tonal_an.analyze(lc);
+                        live_tonal.store(lc.features.tonal_alignment_score, std::memory_order_relaxed);
+                        live_rolloff.store(lc.features.rolloff_freq, std::memory_order_relaxed);
+                        live_valid.store(true, std::memory_order_release);
+                    }
+                }
             }
 
             if (!rec) continue;
@@ -320,6 +371,12 @@ int main(int argc, char** argv) {
 
         uint32_t rng = 0x12345678u;
 
+        // master output envelope: ramps up on signal, decays slowly on silence
+        // per-period increments at 256 frames / 48kHz ≈ 5.3ms per period
+        float master_env = 0.0f;
+        static constexpr float kMasterAttack  = 0.10f;   // ~53ms to full
+        static constexpr float kMasterRelease = 0.008f;  // ~660ms tail
+
         auto next_switch = std::chrono::steady_clock::now();
 
         while (g_run.load(std::memory_order_relaxed)) {
@@ -348,10 +405,23 @@ int main(int argc, char** argv) {
             else {
                 // grains mode: overlapping random slice playback
                 auto now = std::chrono::steady_clock::now();
-                if (now >= next_switch) {
+                // silence gate: don't trigger new grains when live input is quiet
+                bool live_active = !live_valid.load(std::memory_order_acquire)
+                                   || live_rms.load(std::memory_order_relaxed) >= 0.01f;
+                if (now >= next_switch && live_active) {
                     rng = xorshift32(rng);
                     int new_id = -1;
-                    if (store.random_id(rng, new_id)) {
+                    bool found_id = false;
+                    if (live_valid.load(std::memory_order_acquire)) {
+                        found_id = store.closest_k_id(
+                            live_tonal.load(std::memory_order_relaxed),
+                            live_rolloff.load(std::memory_order_relaxed),
+                            live_rms.load(std::memory_order_relaxed),
+                            grain_k.load(std::memory_order_relaxed),
+                            rng, new_id);
+                    }
+                    if (!found_id) found_id = store.random_id(rng, new_id);
+                    if (found_id) {
                         Slice tmp;
                         if (store.get(new_id, tmp)) {
                             // per-grain jitter: ±25% of glen_ms at grain start
@@ -420,8 +490,17 @@ int main(int argc, char** argv) {
                         if (v.pos >= v.play_end) v.active = false;
                     }
                 }
+                // advance master envelope toward target (1 when active, 0 when silent)
+                float env_target = live_active ? 1.0f : 0.0f;
+                float env_step   = live_active ? kMasterAttack : kMasterRelease;
+                if (master_env < env_target) {
+                    master_env = std::min(master_env + env_step, 1.0f);
+                } else {
+                    master_env = std::max(master_env - env_step, 0.0f);
+                }
+
                 for (size_t i = 0; i < samples_per_period; i++) {
-                    int32_t s = mix[i];
+                    int32_t s = (int32_t)(mix[i] * master_env);
                     out[i] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
                 }
                 got = samples_per_period;
@@ -575,6 +654,16 @@ int main(int argc, char** argv) {
                                 slice.features.chroma_energy, idx, sc);
                 }
                 std::fprintf(stderr, "[key] tonal scale=%s\n", minor ? "minor" : "major");
+            }
+
+            else if (k == 'k') {
+                static const int kSteps[] = {1, 3, 5, 10};
+                int cur = grain_k.load();
+                int next_k = kSteps[0];
+                for (int i = 0; i < 3; i++)
+                    if (kSteps[i] == cur) { next_k = kSteps[i + 1]; break; }
+                grain_k.store(next_k);
+                std::fprintf(stderr, "[key] grain_k=%d\n", next_k);
             }
 
             else if (k == '1') { grain_interval_ms.store(1000); std::fprintf(stderr, "[key] interval=1000ms\n"); }
