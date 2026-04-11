@@ -1,15 +1,35 @@
-import spidev, time
+from gpiozero import OutputDevice, InputDevice
+import time
 
-spi = spidev.SpiDev()
-spi.open(0, 0)  # bus 0, CE0
-spi.max_speed_hz = 1_000_000
+SCLK = OutputDevice(11)
+MOSI = OutputDevice(10)
+MISO = InputDevice(9, pull_up=False)
+CS = OutputDevice(25, active_high=False, initial_value=False)
 
 def read_channel(ch):
-    # format: [1, channel (8-15), 0]
-    r = spi.xfer2([1, (8 + ch) << 4, 0])
-    # keep bottom 2 bits of r[1], left shift + OR with r[2] to get full 10-bit value
-    return ((r[1] & 3) << 8) | r[2]
-    
+    CS.on()
+    time.sleep(0.000002)
+
+    for bit in [1, 1, (ch >> 2) & 1, (ch >> 1) & 1, ch & 1]:
+        SCLK.off()
+        MOSI.value = bit
+        time.sleep(0.000002)
+        SCLK.on()
+        time.sleep(0.000002)
+
+    result = 0
+    for i in range(12):
+        SCLK.off()
+        time.sleep(0.000002)
+        SCLK.on()
+        time.sleep(0.000002)
+        if i >= 2:
+            result = (result << 1) | MISO.value
+
+    SCLK.off()
+    CS.off()
+    return result
+
 while True:
     for ch in range(2):
         raw = read_channel(ch)
