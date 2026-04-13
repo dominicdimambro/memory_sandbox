@@ -9,6 +9,10 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+#include <linux/gpio.h>
 
 #include "alsa_util.h"
 #include "grain_pipeline.h"
@@ -532,6 +536,276 @@ int main(int argc, char** argv) {
         }
     });
 
+    // ---- encoder thread (MCP23017 via I2C) ----
+    std::thread encoder_thread([&] {
+        int fd = open("/dev/i2c-1", O_RDWR);
+        if (fd < 0) {
+            std::fprintf(stderr, "[encoder] failed to open /dev/i2c-1\n");
+            return;
+        }
+        if (ioctl(fd, I2C_SLAVE, 0x20) < 0) {
+            std::fprintf(stderr, "[encoder] failed to set I2C slave address\n");
+            close(fd);
+            return;
+        }
+
+        auto i2c_write_reg = [&](uint8_t reg, uint8_t val) {
+            uint8_t buf[2] = {reg, val};
+            write(fd, buf, 2);
+        };
+        auto i2c_read_reg = [&](uint8_t reg) -> uint8_t {
+            write(fd, &reg, 1);
+            uint8_t val = 0;
+            read(fd, &val, 1);
+            return val;
+        };
+
+        // all pins as inputs
+        i2c_write_reg(0x00, 0xFF);  // IODIRA
+        i2c_write_reg(0x01, 0xFF);  // IODIRB
+        // pull-ups on GPA6, GPA7 (encoder) and GPB0 (button)
+        i2c_write_reg(0x0C, 0xC0);  // GPPUA
+        i2c_write_reg(0x0D, 0x01);  // GPPUB
+
+        int counter = 0;
+        uint8_t prev_a = (i2c_read_reg(0x12) >> 7) & 1;
+        uint8_t prev_btn = 0xFF;
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            uint8_t port_a = i2c_read_reg(0x12);  // GPIOA
+            uint8_t port_b = i2c_read_reg(0x13);  // GPIOB
+
+            uint8_t enc_a = (port_a >> 7) & 1;
+            uint8_t enc_b = (port_a >> 6) & 1;
+            uint8_t btn   = (port_b >> 0) & 1;
+
+            if (enc_a != prev_a) {
+                if (enc_a == 1)
+                    counter += (enc_b == 0) ? 1 : -1;
+                else
+                    counter += (enc_b == 1) ? 1 : -1;
+                std::fprintf(stderr, "[encoder] counter=%d\n", counter);
+            }
+            if (btn != prev_btn) {
+                std::fprintf(stderr, "[encoder] button=%s\n", btn == 0 ? "pressed" : "released");
+                prev_btn = btn;
+            }
+
+            prev_a = enc_a;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        close(fd);
+    });
+
+    // ---- input gain presets (dB, PCM1863 PGA via ALSA enum control) ----
+    static constexpr const char* kMixerCard      = "hw:2";
+    static constexpr float kGainLine_dB       =  0.0f;  // TRS line level
+    static constexpr float kGainInstrument_dB = 20.0f;  // TRS instrument level
+    static constexpr float kGainDualJack_dB   =  0.0f;  // dual jack stereo (line)
+    static constexpr float kGainMic_dB        = 30.0f;  // XLR mic mono
+
+    std::atomic<int> current_input_mode{-1};
+
+    // ---- rotary switch thread (GPIO 5 + 6 direct to Pi) ----
+    std::thread switch_thread([&] {
+        int chip_fd = open("/dev/gpiochip4", O_RDONLY);
+        if (chip_fd < 0) {
+            std::fprintf(stderr, "[switch] failed to open /dev/gpiochip4\n");
+            return;
+        }
+
+        struct gpio_v2_line_request req = {};
+        req.offsets[0] = 16;
+        req.offsets[1] = 26;
+        req.num_lines   = 2;
+        req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_BIAS_PULL_UP;
+        std::strncpy(req.consumer, "engine-switch", sizeof(req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+            std::fprintf(stderr, "[switch] failed to get GPIO lines\n");
+            close(chip_fd);
+            return;
+        }
+        close(chip_fd);
+
+        int prev_mode = -1;
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            struct gpio_v2_line_values vals = {};
+            vals.mask = 0b11;
+            if (ioctl(req.fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals) < 0) {
+                std::fprintf(stderr, "[switch] read error\n");
+                break;
+            }
+
+            int gpio5 = (vals.bits >> 0) & 1;
+            int gpio6 = (vals.bits >> 1) & 1;
+            int mode  = (gpio6 << 1) | gpio5;  // 2-bit position: 0-3
+
+            if (mode != prev_mode) {
+                const char* names[] = {"???", "XLR mic mono", "Dual jack stereo", "TRS stereo"};
+                std::fprintf(stderr, "[switch] mode=%s (GPIO5=%d GPIO6=%d)\n",
+                    names[mode], gpio5, gpio6);
+
+                float gain = kGainLine_dB;
+                switch (mode) {
+                    case 1: gain = kGainMic_dB;       break;
+                    case 2: gain = kGainDualJack_dB;  break;
+                    case 3: gain = kGainLine_dB;       break;
+                }
+                if (mode != 0) {
+                    if (set_pga_gain_db(kMixerCard, gain))
+                        std::fprintf(stderr, "[gain] set %.1fdB for mode %s\n", gain, names[mode]);
+                }
+                current_input_mode.store(mode, std::memory_order_relaxed);
+                prev_mode = mode;
+            }
+
+            // TRS stereo (mode 3): auto-detect instrument vs line level with hysteresis
+            if (current_input_mode.load(std::memory_order_relaxed) == 3) {
+                static constexpr float kLowRms          = 0.03f;  // below = instrument level
+                static constexpr float kHighRms         = 0.08f;  // above = line level
+                static constexpr int   kHoldMs          = 3000;
+                static constexpr float kSignalPresent   = 0.01f;  // must be above this to count as signal (not silence)
+                static bool trs_instrument = false;
+                static auto low_since  = std::chrono::steady_clock::time_point{};
+                static auto high_since = std::chrono::steady_clock::time_point{};
+                static bool low_timing  = false;
+                static bool high_timing = false;
+
+                float rms = live_rms.load(std::memory_order_relaxed);
+                auto now = std::chrono::steady_clock::now();
+
+                if (!trs_instrument) {
+                    // currently at line gain — watch for quiet signal
+                    if (rms > kSignalPresent && rms < kLowRms) {
+                        if (!low_timing) { low_since = now; low_timing = true; }
+                        else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - low_since).count() >= kHoldMs) {
+                            trs_instrument = true;
+                            low_timing = false;
+                            set_pga_gain_db(kMixerCard, kGainInstrument_dB);
+                            std::fprintf(stderr, "[gain] TRS: instrument level detected → %.1fdB\n", kGainInstrument_dB);
+                        }
+                    } else {
+                        low_timing = false;
+                    }
+                } else {
+                    // currently at instrument gain — watch for loud signal
+                    if (rms > kHighRms) {
+                        if (!high_timing) { high_since = now; high_timing = true; }
+                        else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - high_since).count() >= kHoldMs) {
+                            trs_instrument = false;
+                            high_timing = false;
+                            set_pga_gain_db(kMixerCard, kGainLine_dB);
+                            std::fprintf(stderr, "[gain] TRS: line level detected → %.1fdB\n", kGainLine_dB);
+                        }
+                    } else {
+                        high_timing = false;
+                    }
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        close(req.fd);
+    });
+
+    // ---- LED thread (GPIO 23 = green anode, GPIO 24 = red anode) ----
+    // recording: green on, red off  |  stopped: green off, red on
+    std::thread led_thread([&] {
+        int chip_fd = open("/dev/gpiochip4", O_RDONLY);
+        if (chip_fd < 0) {
+            std::fprintf(stderr, "[led] failed to open /dev/gpiochip4\n");
+            return;
+        }
+
+        struct gpio_v2_line_request led_req = {};
+        led_req.offsets[0] = 23;  // green anode
+        led_req.offsets[1] = 24;  // red anode
+        led_req.num_lines   = 2;
+        led_req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+        std::strncpy(led_req.consumer, "engine-led", sizeof(led_req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &led_req) < 0) {
+            std::fprintf(stderr, "[led] failed to get GPIO lines\n");
+            close(chip_fd);
+            return;
+        }
+        close(chip_fd);
+
+        bool prev_rec = !record_enabled.load();  // force update on first iteration
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            bool rec = record_enabled.load(std::memory_order_relaxed);
+            if (rec != prev_rec) {
+                struct gpio_v2_line_values vals = {};
+                vals.mask = 0b11;
+                vals.bits = rec ? 0b01 : 0b10;  // rec: green=1 red=0 | idle: green=0 red=1
+                ioctl(led_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals);
+                prev_rec = rec;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        // turn both off on shutdown
+        struct gpio_v2_line_values off = {};
+        off.mask = 0b11;
+        off.bits = 0b00;
+        ioctl(led_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &off);
+        close(led_req.fd);
+    });
+
+    // ---- record button thread (GPIO 12, active-low, toggles record_enabled) ----
+    std::thread button_thread([&] {
+        int chip_fd = open("/dev/gpiochip4", O_RDONLY);
+        if (chip_fd < 0) {
+            std::fprintf(stderr, "[btn] failed to open /dev/gpiochip4\n");
+            return;
+        }
+
+        struct gpio_v2_line_request btn_req = {};
+        btn_req.offsets[0] = 12;
+        btn_req.num_lines   = 1;
+        btn_req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_BIAS_PULL_UP;
+        std::strncpy(btn_req.consumer, "engine-recbtn", sizeof(btn_req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &btn_req) < 0) {
+            std::fprintf(stderr, "[btn] failed to get GPIO line\n");
+            close(chip_fd);
+            return;
+        }
+        close(chip_fd);
+
+        int prev_level = 1;  // assume released (pulled high)
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            struct gpio_v2_line_values vals = {};
+            vals.mask = 0b1;
+            if (ioctl(btn_req.fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals) < 0) {
+                std::fprintf(stderr, "[btn] read error\n");
+                break;
+            }
+
+            int level = vals.bits & 1;
+
+            // falling edge = button pressed (pin pulled to GND)
+            if (level == 0 && prev_level == 1) {
+                bool rec = !record_enabled.load(std::memory_order_relaxed);
+                record_enabled.store(rec, std::memory_order_relaxed);
+                if (rec) {
+                    std::lock_guard<std::mutex> lk(rb_mtx);
+                    rb.clear();
+                }
+                std::fprintf(stderr, "[btn] record_enabled = %s\n", rec ? "true" : "false");
+            }
+
+            prev_level = level;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // debounce
+        }
+
+        close(btn_req.fd);
+    });
+
     viz.start();
 
     // ---- key input loop ----
@@ -705,6 +979,10 @@ int main(int argc, char** argv) {
     if (cap_thread.joinable()) cap_thread.join();
     if (pb_thread.joinable()) pb_thread.join();
     if (slicer_thread.joinable()) slicer_thread.join();
+    if (encoder_thread.joinable()) encoder_thread.join();
+    if (switch_thread.joinable()) switch_thread.join();
+    if (led_thread.joinable()) led_thread.join();
+    if (button_thread.joinable()) button_thread.join();
 
     snd_pcm_close(cap);
     snd_pcm_close(pb);

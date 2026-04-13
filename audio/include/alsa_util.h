@@ -22,3 +22,8 @@ bool open_pcm(snd_pcm_t** out,
 
 // recover from xrun (underrun/overrun) or suspend
 void recover_if_xrun(snd_pcm_t* pcm, int err, const char* tag);
+
+// Set PGA gain on the HifiBerry ADC (PCM1863) via ALSA enum mixer control.
+// card: ALSA card name e.g. "hw:2". db: gain in dB, clamped to [-12, 32].
+// Sets both left and right channels.
+bool set_pga_gain_db(const char* card, float db);

@@ -1,5 +1,7 @@
 #include "alsa_util.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <thread>
@@ -61,6 +63,51 @@ bool open_pcm(snd_pcm_t** out,
         return false;
     }
     return true;
+}
+
+bool set_pga_gain_db(const char* card, float db) {
+    // Clamp to HAT-rated range
+    db = std::max(-12.0f, std::min(db, 32.0f));
+
+    // Enum index: items start at -12.0dB in 0.5dB steps → index = (db + 12) * 2
+    unsigned int idx = (unsigned int)std::lround((db + 12.0f) * 2.0f);
+
+    snd_mixer_t* mixer = nullptr;
+    if (snd_mixer_open(&mixer, 0) < 0) {
+        std::fprintf(stderr, "[gain] snd_mixer_open failed\n");
+        return false;
+    }
+    if (snd_mixer_attach(mixer, card) < 0) {
+        std::fprintf(stderr, "[gain] snd_mixer_attach(%s) failed\n", card);
+        snd_mixer_close(mixer);
+        return false;
+    }
+    snd_mixer_selem_register(mixer, nullptr, nullptr);
+    snd_mixer_load(mixer);
+
+    const char* elem_names[] = {"PGA Gain Left", "PGA Gain Right"};
+    bool ok = true;
+    for (const char* name : elem_names) {
+        snd_mixer_selem_id_t* sid = nullptr;
+        snd_mixer_selem_id_alloca(&sid);
+        snd_mixer_selem_id_set_index(sid, 0);
+        snd_mixer_selem_id_set_name(sid, name);
+
+        snd_mixer_elem_t* elem = snd_mixer_find_selem(mixer, sid);
+        if (!elem) {
+            std::fprintf(stderr, "[gain] element '%s' not found\n", name);
+            ok = false;
+            continue;
+        }
+        if (snd_mixer_selem_set_enum_item(elem, SND_MIXER_SCHN_FRONT_LEFT,  idx) < 0 ||
+            snd_mixer_selem_set_enum_item(elem, SND_MIXER_SCHN_FRONT_RIGHT, idx) < 0) {
+            std::fprintf(stderr, "[gain] failed to set '%s' to index %u\n", name, idx);
+            ok = false;
+        }
+    }
+
+    snd_mixer_close(mixer);
+    return ok;
 }
 
 void recover_if_xrun(snd_pcm_t* pcm, int err, const char* tag) {
