@@ -537,6 +537,10 @@ int main(int argc, char** argv) {
     });
 
     // ---- encoder thread (MCP23017 via I2C) ----
+    // enc1: A=GPA7 B=GPA6 btn=GPB0
+    // enc2: A=GPA5 B=GPA4 btn=GPB1
+    // enc3: A=GPA3 B=GPA2 btn=GPB2
+    // enc4: A=GPA1 B=GPA0 btn=GPB3
     std::thread encoder_thread([&] {
         int fd = open("/dev/i2c-1", O_RDWR);
         if (fd < 0) {
@@ -560,38 +564,55 @@ int main(int argc, char** argv) {
             return val;
         };
 
-        // all pins as inputs
-        i2c_write_reg(0x00, 0xFF);  // IODIRA
-        i2c_write_reg(0x01, 0xFF);  // IODIRB
-        // pull-ups on GPA6, GPA7 (encoder) and GPB0 (button)
-        i2c_write_reg(0x0C, 0xC0);  // GPPUA
-        i2c_write_reg(0x0D, 0x01);  // GPPUB
+        // all GPA pins as inputs (all encoder A/B lines)
+        i2c_write_reg(0x00, 0xFF);        // IODIRA
+        i2c_write_reg(0x01, 0xFF);        // IODIRB
+        // pull-ups on all 8 GPA encoder pins and 4 button pins (GPB0,1,2,3)
+        i2c_write_reg(0x0C, 0xFF);        // GPPUA: GPA0-7
+        i2c_write_reg(0x0D, 0b00001111);  // GPPUB: GPB0,1,2,3
 
-        int counter = 0;
-        uint8_t prev_a = (i2c_read_reg(0x12) >> 7) & 1;
-        uint8_t prev_btn = 0xFF;
+        // A-pin bit positions in port_a (odd bits), B-pin (even bits below each A)
+        static constexpr uint8_t kABit[4] = { 7, 5, 3, 1 };
+        static constexpr uint8_t kBBit[4] = { 6, 4, 2, 0 };
+        // button bit positions in port_b
+        static constexpr uint8_t kBtnBit[4] = { 0, 1, 2, 3 };
+
+        uint8_t init_a = i2c_read_reg(0x12);
+        uint8_t prev_a[4];
+        for (int i = 0; i < 4; i++)
+            prev_a[i] = (init_a >> kABit[i]) & 1;
+
+        int      counters[4]  = {};
+        uint8_t  prev_btn_raw = 0xFF;  // all released (pulled high)
 
         while (g_run.load(std::memory_order_relaxed)) {
             uint8_t port_a = i2c_read_reg(0x12);  // GPIOA
             uint8_t port_b = i2c_read_reg(0x13);  // GPIOB
 
-            uint8_t enc_a = (port_a >> 7) & 1;
-            uint8_t enc_b = (port_a >> 6) & 1;
-            uint8_t btn   = (port_b >> 0) & 1;
-
-            if (enc_a != prev_a) {
-                if (enc_a == 1)
-                    counter += (enc_b == 0) ? 1 : -1;
-                else
-                    counter += (enc_b == 1) ? 1 : -1;
-                std::fprintf(stderr, "[encoder] counter=%d\n", counter);
-            }
-            if (btn != prev_btn) {
-                std::fprintf(stderr, "[encoder] button=%s\n", btn == 0 ? "pressed" : "released");
-                prev_btn = btn;
+            // decode all four encoders
+            for (int i = 0; i < 4; i++) {
+                uint8_t a = (port_a >> kABit[i]) & 1;
+                uint8_t b = (port_a >> kBBit[i]) & 1;
+                if (a != prev_a[i]) {
+                    counters[i] += (a == 1) ? (b == 0 ? -1 : 1)
+                                            : (b == 1 ? -1 : 1);
+                    std::fprintf(stderr, "[encoder%d] counter=%d\n", i + 1, counters[i]);
+                    prev_a[i] = a;
+                }
             }
 
-            prev_a = enc_a;
+            // check all four buttons
+            for (int i = 0; i < 4; i++) {
+                uint8_t mask = 1u << kBtnBit[i];
+                uint8_t cur  = port_b  & mask;
+                uint8_t prev = prev_btn_raw & mask;
+                if (cur != prev) {
+                    std::fprintf(stderr, "[encoder%d] button=%s\n",
+                        i + 1, cur == 0 ? "pressed" : "released");
+                }
+            }
+            prev_btn_raw = port_b;
+
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         close(fd);
