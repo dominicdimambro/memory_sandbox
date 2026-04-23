@@ -23,8 +23,8 @@ void GrainVisualizer::stop() {
 }
 
 void GrainVisualizer::render_loop() {
-    // Always auto-detect Wayland socket if not already set — covers VNC sessions
-    // and SSH where the compositor is running but the env var isn't exported.
+    // Auto-detect Wayland socket — covers SSH sessions where the compositor runs
+    // but the env var isn't exported.
     if (!getenv("WAYLAND_DISPLAY")) {
         char path[128];
         uid_t uid = getuid();
@@ -40,7 +40,9 @@ void GrainVisualizer::render_loop() {
         }
     }
 
-    // Try drivers in preference order: Wayland (local/VNC) → kmsdrm → x11.
+    // Try drivers in preference order: Wayland → kmsdrm → x11.
+    // If x11 fails and we're in an SSH session with a forwarded/mismatched DISPLAY,
+    // retry x11 with the local Xorg socket directly.
     static const char* kDrivers[] = {"wayland", "kmsdrm", "x11", nullptr};
     bool inited = false;
     for (int i = 0; kDrivers[i]; ++i) {
@@ -53,17 +55,51 @@ void GrainVisualizer::render_loop() {
         std::fprintf(stderr, "[viz] %s failed: %s\n", kDrivers[i], SDL_GetError());
         SDL_Quit();
     }
+
+    // Fallback: SSH X11 forwarding sets DISPLAY to a tunnel (e.g. localhost:10.0) whose
+    // auth cookie hostname often doesn't match what Xlib looks up, causing X11 to fail
+    // above. If there's a local Xorg socket, point directly at it instead.
     if (!inited) {
-        std::fprintf(stderr, "[viz] no usable SDL video driver (tried kmsdrm/wayland/x11) — visualizer disabled\n");
+        static const char* kLocalDisplays[] = {":0", ":1", nullptr};
+        for (int i = 0; kLocalDisplays[i] && !inited; ++i) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "/tmp/.X11-unix/X%s", kLocalDisplays[i] + 1);
+            if (access(path, F_OK) != 0) continue;
+            setenv("DISPLAY", kLocalDisplays[i], 1);  // override SSH tunnel display
+            // Ensure ~/.Xauthority is used (has the local :0 cookie even when XAUTHORITY unset)
+            if (!getenv("XAUTHORITY")) {
+                const char* home = getenv("HOME");
+                if (home) {
+                    char xauth[256];
+                    std::snprintf(xauth, sizeof(xauth), "%s/.Xauthority", home);
+                    if (access(xauth, F_OK) == 0)
+                        setenv("XAUTHORITY", xauth, 0);
+                }
+            }
+            SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");
+            if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+                std::fprintf(stderr, "[viz] SDL video driver: x11 (local fallback %s)\n", kLocalDisplays[i]);
+                inited = true;
+            } else {
+                std::fprintf(stderr, "[viz] x11 local fallback %s failed: %s\n", kLocalDisplays[i], SDL_GetError());
+                SDL_Quit();
+            }
+        }
+    }
+
+    if (!inited) {
+        std::fprintf(stderr, "[viz] no usable SDL video driver — visualizer disabled\n");
         return;
     }
 
-    window_ = SDL_CreateWindow("Grain Space", 0, 0, w_, h_, 0);
+    window_ = SDL_CreateWindow("Grain Space", 0, 0, w_, h_, SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!window_) {
         std::fprintf(stderr, "[viz] SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return;
     }
+
+    SDL_ShowCursor(SDL_DISABLE);
 
     renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer_) {
