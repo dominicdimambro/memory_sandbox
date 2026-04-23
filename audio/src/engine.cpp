@@ -618,6 +618,102 @@ int main(int argc, char** argv) {
         close(fd);
     });
 
+    // ---- MCP3008 potentiometer thread (bit-bang SPI: SCLK=11, MOSI=10, MISO=9, CS=25) ----
+    std::thread mcp3008_thread([&] {
+        int chip_fd = open("/dev/gpiochip4", O_RDONLY);
+        if (chip_fd < 0) {
+            std::fprintf(stderr, "[pot] failed to open /dev/gpiochip4\n");
+            return;
+        }
+
+        // outputs: SCLK=offset[0]=11, MOSI=offset[1]=10, CS=offset[2]=25
+        struct gpio_v2_line_request out_req = {};
+        out_req.offsets[0] = 11;
+        out_req.offsets[1] = 10;
+        out_req.offsets[2] = 25;
+        out_req.num_lines  = 3;
+        out_req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+        out_req.config.attrs[0].attr.id     = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
+        out_req.config.attrs[0].attr.values = 0b100;  // CS=1, MOSI=0, SCLK=0
+        out_req.config.attrs[0].mask        = 0b111;
+        out_req.config.num_attrs = 1;
+        std::strncpy(out_req.consumer, "engine-mcp-out", sizeof(out_req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &out_req) < 0) {
+            std::fprintf(stderr, "[pot] failed to get output GPIO lines\n");
+            close(chip_fd);
+            return;
+        }
+
+        // input: MISO=9
+        struct gpio_v2_line_request in_req = {};
+        in_req.offsets[0] = 9;
+        in_req.num_lines  = 1;
+        in_req.config.flags = GPIO_V2_LINE_FLAG_INPUT;
+        std::strncpy(in_req.consumer, "engine-mcp-in", sizeof(in_req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &in_req) < 0) {
+            std::fprintf(stderr, "[pot] failed to get input GPIO line\n");
+            close(chip_fd);
+            close(out_req.fd);
+            return;
+        }
+        close(chip_fd);
+
+        // bit positions in out_req: 0=SCLK, 1=MOSI, 2=CS
+        auto set_pin = [&](uint64_t bit, int val) {
+            struct gpio_v2_line_values v = {};
+            v.bits = val ? bit : 0;
+            v.mask = bit;
+            ioctl(out_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &v);
+        };
+        auto get_miso = [&]() -> int {
+            struct gpio_v2_line_values v = {};
+            v.mask = 1;
+            ioctl(in_req.fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &v);
+            return v.bits & 1;
+        };
+
+        auto read_channel = [&](int ch) -> int {
+            set_pin(4, 0);  // CS low
+            int bits_out[] = {1, 1, (ch >> 2) & 1, (ch >> 1) & 1, ch & 1};
+            for (int b : bits_out) {
+                set_pin(1, 0);  // SCLK low
+                set_pin(2, b);  // MOSI
+                set_pin(1, 1);  // SCLK high
+            }
+            int result = 0;
+            for (int i = 0; i < 12; i++) {
+                set_pin(1, 0);
+                set_pin(1, 1);
+                if (i >= 2)
+                    result = (result << 1) | get_miso();
+            }
+            set_pin(1, 0);  // SCLK low
+            set_pin(4, 1);  // CS high
+            return result;
+        };
+
+        int prev[8] = {};
+        static constexpr int kThreshold = 8;
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            for (int ch = 0; ch < 8; ch++) {
+                int val = read_channel(ch);
+                int diff = val - prev[ch];
+                if (diff < 0) diff = -diff;
+                if (diff >= kThreshold) {
+                    std::fprintf(stderr, "[pot] ch%d=%d\n", ch, val);
+                    prev[ch] = val;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        close(out_req.fd);
+        close(in_req.fd);
+    });
+
     // ---- input gain presets (dB, PCM1863 PGA via ALSA enum control) ----
     static constexpr const char* kMixerCard      = "hw:2";
     static constexpr float kGainLine_dB       =  0.0f;  // TRS line level
@@ -741,8 +837,8 @@ int main(int argc, char** argv) {
         }
 
         struct gpio_v2_line_request led_req = {};
-        led_req.offsets[0] = 23;  // green anode
-        led_req.offsets[1] = 24;  // red anode
+        led_req.offsets[0] = 17;  // green anode
+        led_req.offsets[1] = 27;  // red anode
         led_req.num_lines   = 2;
         led_req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
         std::strncpy(led_req.consumer, "engine-led", sizeof(led_req.consumer) - 1);
@@ -774,6 +870,49 @@ int main(int argc, char** argv) {
         off.bits = 0b00;
         ioctl(led_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &off);
         close(led_req.fd);
+    });
+
+    // ---- momentary button thread (GPIO 14, active-low) ----
+    std::thread moment_btn_thread([&] {
+        int chip_fd = open("/dev/gpiochip4", O_RDONLY);
+        if (chip_fd < 0) {
+            std::fprintf(stderr, "[mbtn] failed to open /dev/gpiochip4\n");
+            return;
+        }
+
+        struct gpio_v2_line_request mbtn_req = {};
+        mbtn_req.offsets[0] = 13;
+        mbtn_req.num_lines   = 1;
+        mbtn_req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_BIAS_PULL_UP;
+        std::strncpy(mbtn_req.consumer, "engine-mbtn", sizeof(mbtn_req.consumer) - 1);
+
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &mbtn_req) < 0) {
+            std::fprintf(stderr, "[mbtn] failed to get GPIO line\n");
+            close(chip_fd);
+            return;
+        }
+        close(chip_fd);
+
+        int prev_level = 1;
+
+        while (g_run.load(std::memory_order_relaxed)) {
+            struct gpio_v2_line_values vals = {};
+            vals.mask = 0b1;
+            if (ioctl(mbtn_req.fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals) < 0) {
+                std::fprintf(stderr, "[mbtn] read error\n");
+                break;
+            }
+
+            int level = vals.bits & 1;
+
+            if (level == 0 && prev_level == 1)
+                std::fprintf(stderr, "[mbtn] pressed\n");
+
+            prev_level = level;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        close(mbtn_req.fd);
     });
 
     // ---- record button thread (GPIO 12, active-low, toggles record_enabled) ----
@@ -1001,6 +1140,8 @@ int main(int argc, char** argv) {
     if (pb_thread.joinable()) pb_thread.join();
     if (slicer_thread.joinable()) slicer_thread.join();
     if (encoder_thread.joinable()) encoder_thread.join();
+    if (mcp3008_thread.joinable()) mcp3008_thread.join();
+    if (moment_btn_thread.joinable()) moment_btn_thread.join();
     if (switch_thread.joinable()) switch_thread.join();
     if (led_thread.joinable()) led_thread.join();
     if (button_thread.joinable()) button_thread.join();

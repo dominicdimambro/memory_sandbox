@@ -31,7 +31,7 @@ def read_channel(ch):
     return result
 
 while True:
-    for ch in range(2):
+    for ch in range(8):
         raw = read_channel(ch)
         volts = raw * 3.3 / 1023
         print(f"CH{ch}: {raw:4d} | {volts:.3f}V", end="  ")
