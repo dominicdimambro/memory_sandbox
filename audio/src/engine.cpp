@@ -1,12 +1,20 @@
 #include <alsa/asoundlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <vector>
 #include <fcntl.h>
@@ -24,8 +32,6 @@
 
 static std::atomic<bool> g_run{true};
 
-// Returns cumulative CPU time (user + sys) for this process in clock ticks.
-// Reads /proc/self/stat; fields 14+15 (utime, stime) follow the comm field.
 static uint64_t read_cpu_ticks() {
     FILE* f = fopen("/proc/self/stat", "r");
     if (!f) return 0;
@@ -33,23 +39,146 @@ static uint64_t read_cpu_ticks() {
     bool ok = fgets(buf, sizeof(buf), f) != nullptr;
     fclose(f);
     if (!ok) return 0;
-    const char* p = strrchr(buf, ')');  // comm ends at last ')'
+    const char* p = strrchr(buf, ')');
     if (!p) return 0;
-    p += 2;  // skip ') '
+    p += 2;
     unsigned long utime = 0, stime = 0;
-    // after comm: state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime
     sscanf(p, "%*c %*d %*d %*d %*d %*d %*lu %*lu %*lu %*lu %*lu %lu %lu",
            &utime, &stime);
     return (uint64_t)(utime + stime);
 }
 
-int main(int argc, char** argv) {
+// ---- bank persistence ----
 
-    // capture and playback devices with default fallbacks
+#pragma pack(push, 1)
+struct GranHeader {
+    char     magic[4];
+    uint32_t version;
+    uint32_t slice_count;
+    uint64_t corpus_samples;
+    char     name[64];
+};
+struct GranSliceRec {
+    int32_t  id;
+    uint64_t corpus_start;
+    uint32_t length;
+    SliceFeatures features;
+};
+#pragma pack(pop)
+
+static std::string banks_dir() {
+    const char* home = getenv("HOME");
+    return std::string(home ? home : "/tmp") + "/.granular/banks/";
+}
+static std::string cfg_path() {
+    const char* home = getenv("HOME");
+    return std::string(home ? home : "/tmp") + "/.granular/last.cfg";
+}
+static std::string timestamp_name() {
+    auto t = std::time(nullptr);
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "bank_%Y%m%d_%H%M%S", &tm_info);
+    return std::string(buf) + ".gran";
+}
+
+static bool save_bank(SliceStore& s, const std::string& path, const std::string& name) {
+    std::lock_guard<std::mutex> lk(s.mtx);
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    GranHeader hdr = {};
+    hdr.magic[0]='G'; hdr.magic[1]='R'; hdr.magic[2]='A'; hdr.magic[3]='N';
+    hdr.version = 1;
+    hdr.slice_count    = (uint32_t)s.slices.size();
+    hdr.corpus_samples = (uint64_t)s.corpus.size();
+    std::strncpy(hdr.name, name.c_str(), 63);
+    f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    f.write(reinterpret_cast<const char*>(s.corpus.data()),
+            (std::streamsize)(s.corpus.size() * sizeof(int16_t)));
+    for (auto& [id, sl] : s.slices) {
+        GranSliceRec rec = {};
+        rec.id           = (int32_t)sl.id;
+        rec.corpus_start = sl.corpus_start;
+        rec.length       = sl.length;
+        rec.features     = sl.features;
+        f.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+    }
+    return f.good();
+}
+
+static bool load_bank(SliceStore& s, const std::string& path, std::string& out_name) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    GranHeader hdr = {};
+    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!f || std::strncmp(hdr.magic, "GRAN", 4) != 0 || hdr.version != 1) return false;
+    std::vector<int16_t> corpus(hdr.corpus_samples);
+    f.read(reinterpret_cast<char*>(corpus.data()),
+           (std::streamsize)(hdr.corpus_samples * sizeof(int16_t)));
+    if (!f) return false;
+    std::vector<GranSliceRec> recs(hdr.slice_count);
+    for (uint32_t i = 0; i < hdr.slice_count; i++) {
+        f.read(reinterpret_cast<char*>(&recs[i]), sizeof(GranSliceRec));
+        if (!f) return false;
+    }
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.corpus = std::move(corpus);
+    s.slices.clear();
+    s.next_id = 0;
+    for (auto& rec : recs) {
+        Slice sl;
+        sl.id           = (int)rec.id;
+        sl.corpus_start = rec.corpus_start;
+        sl.length       = rec.length;
+        sl.features     = rec.features;
+        s.slices[sl.id] = sl;
+        if (sl.id >= s.next_id) s.next_id = sl.id + 1;
+    }
+    out_name = std::string(hdr.name, strnlen(hdr.name, 64));
+    return true;
+}
+
+static std::vector<std::string> list_banks() {
+    std::vector<std::string> result;
+    std::error_code ec;
+    if (!std::filesystem::exists(banks_dir(), ec)) return result;
+    for (auto& entry : std::filesystem::directory_iterator(banks_dir(), ec)) {
+        if (entry.path().extension() == ".gran")
+            result.push_back(entry.path().filename().string());
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+static void save_config(const std::string& a_file, const std::string& b_file, int rec) {
+    std::ofstream f(cfg_path());
+    if (f) {
+        f << "slot_a=" << a_file << "\n";
+        f << "slot_b=" << b_file << "\n";
+        f << "record=" << rec  << "\n";
+    }
+}
+
+static void load_config(std::string& a_file, std::string& b_file, int& rec) {
+    std::ifstream f(cfg_path());
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() > 7 && line.substr(0,7) == "slot_a=") a_file = line.substr(7);
+        else if (line.size() > 7 && line.substr(0,7) == "slot_b=") b_file = line.substr(7);
+        else if (line.size() > 7 && line.substr(0,7) == "record=") {
+            try { rec = std::stoi(line.substr(7)); } catch (...) {}
+        }
+    }
+}
+
+// ---- main ----
+
+int main(int argc, char** argv) {
     const char* cap_dev = (argc > 1) ? argv[1] : "plughw:2,0";
     const char* pb_dev  = (argc > 2) ? argv[2] : "plughw:2,0";
 
-    // hw parameters
     const unsigned int rate = 48000;
     const unsigned int channels = 2;
     const snd_pcm_uframes_t period_frames = 256;
@@ -57,17 +186,14 @@ int main(int argc, char** argv) {
 
     const size_t samples_per_period = (size_t)period_frames * channels;
 
-    // ring buffer: 1 second of interleaved stereo
     const size_t rb_capacity_seconds = 1;
     const size_t rb_capacity_samples = (size_t)rate * channels * rb_capacity_seconds;
     RingBuffer<int16_t> rb(rb_capacity_samples);
     std::mutex rb_mtx;
 
-    // cross-thread control flags
     std::atomic<bool> record_enabled{false};
-    std::atomic<bool> play_enabled{false};
+    std::atomic<bool> play_enabled{true};
 
-    // open ALSA devices
     snd_pcm_t* cap = nullptr;
     snd_pcm_t* pb  = nullptr;
 
@@ -97,22 +223,17 @@ int main(int argc, char** argv) {
     TermRawMode raw;
     raw.enable();
 
-    // slicer: swappable algorithm (default: onset detection)
     auto slicer = std::make_unique<OnsetSlicer>();
 
-    // grain pipeline stages
     std::vector<std::unique_ptr<SlicePreprocessor>> preprocessors;
     std::vector<std::unique_ptr<SliceAnalyzer>>     analyzers;
     std::vector<std::unique_ptr<SliceFilter>>        filters;
 
-    // register preprocessors, analyzers, filters in the desired order
     preprocessors.push_back(std::make_unique<StereoToMonoPreprocessor>());
 
     static constexpr float kRootFreqs[12] = {
         440.000f, 466.164f, 493.883f, 523.251f, 554.365f, 587.330f,
         622.254f, 659.255f, 698.456f, 739.989f, 783.991f, 830.609f,
-    //  A         Bb        B         C         C#        D
-    //  Eb        E         F         F#        G         Ab
     };
 
     analyzers.push_back(std::make_unique<RMSAnalyzer>());
@@ -125,41 +246,92 @@ int main(int argc, char** argv) {
     TonalAlignmentAnalyzer* tonal_ptr = tonal_ptr_own.get();
     analyzers.push_back(std::move(tonal_ptr_own));
 
+    SliceStore store_a;
+    SliceStore store_b;
 
-    SliceStore store;
-
-    // slicer control + state
     std::atomic<uint64_t> rb_epoch{0};
     std::vector<int16_t> one_sec_window(rb_capacity_samples);
 
-    // slicer controls
     std::atomic<float> slicer_sensitivity{1.0f};
 
-    // playback controls
-    // tonal alignment controls
-    // root index: 0=A 1=Bb 2=B 3=C 4=C# 5=D 6=Eb 7=E 8=F 9=F# 10=G 11=Ab
-    std::atomic<int>  tonal_root_idx{0};   // default: A=440Hz
-    std::atomic<bool> tonal_minor{false};  // false=major, true=minor
+    std::atomic<int>  tonal_root_idx{0};
+    std::atomic<bool> tonal_minor{false};
 
     std::atomic<int> grain_interval_ms{1000};
     std::atomic<int> grain_length_ms{200};
     std::atomic<bool> explicit_mode{false};
     std::atomic<int> current_grain_id{-1};
-    // 0.0=percussive  1.0=sustained  2.0=swell  (interpolated between 3 presets)
+    std::atomic<int> current_bank{0};       // 0=store_a, 1=store_b (for viz highlight)
     std::atomic<float> env_pos{1.0f};
     std::atomic<bool> passthrough_enabled{false};
-    std::atomic<float> dry_wet{1.0f};  // 0.0=all dry (passthrough)  1.0=all grains (wet)
+    std::atomic<float> dry_wet{1.0f};
+    std::atomic<bool> mono_passthrough{false};
+    std::atomic<bool> hpf_enabled{false};
 
-    // kNN grain selection
-    std::atomic<int>   grain_k{5};          // k=1/3/5/10, cycled with 'k' key
+    std::atomic<float> fx_amount{0.0f};
+    std::atomic<float> crossfade_pos{0.0f};  // 0=all A, 1=all B
+    std::atomic<int>   record_target{0};     // 0=store_a, 1=store_b
+    std::atomic<int>   new_slice_signal{0};
+    std::atomic<int>   gain_change_pending{0};
+    std::atomic<bool>  gain_confirm{false};
+    std::atomic<bool>  gain_cancel{false};
+
+    std::atomic<int>   grain_k{5};
     std::atomic<float> live_tonal{0.f};
     std::atomic<float> live_rolloff{500.f};
     std::atomic<float> live_rms{0.05f};
-    std::atomic<bool>  live_valid{false};   // true once first valid (non-silent) analysis done
+    std::atomic<bool>  live_valid{false};
 
-    GrainVisualizer viz(store, g_run, current_grain_id);
+    // bank menu shared state (encoder thread writes, visualizer reads)
+    BankMenuDisplay bank_menu_disp;
+    std::mutex      bank_menu_mtx;
+    std::string     bank_name_a, bank_name_b;
 
-    // passthrough ring buffer: small, always written by capture thread
+    // parameter toast (pot thread writes, visualizer reads)
+    ParamToast toast_disp;
+    std::mutex toast_mtx;
+
+    // create banks directory if missing
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(banks_dir(), ec);
+    }
+
+    // auto-load last banks from config
+    {
+        std::string a_file, b_file;
+        int rec_tgt = 0;
+        load_config(a_file, b_file, rec_tgt);
+        if (!a_file.empty()) {
+            std::string loaded_name;
+            if (load_bank(store_a, banks_dir() + a_file, loaded_name)) {
+                bank_name_a = loaded_name;
+                std::fprintf(stderr, "[bank] loaded slot A: %s (%s)\n", a_file.c_str(), loaded_name.c_str());
+            }
+        }
+        if (!b_file.empty()) {
+            std::string loaded_name;
+            if (load_bank(store_b, banks_dir() + b_file, loaded_name)) {
+                bank_name_b = loaded_name;
+                std::fprintf(stderr, "[bank] loaded slot B: %s (%s)\n", b_file.c_str(), loaded_name.c_str());
+            }
+        }
+        if (rec_tgt == 1) record_target.store(1);
+        {
+            std::lock_guard<std::mutex> lk(bank_menu_mtx);
+            bank_menu_disp.bank_name_a = bank_name_a;
+            bank_menu_disp.bank_name_b = bank_name_b;
+            bank_menu_disp.record_target = rec_tgt;
+        }
+    }
+
+    GrainVisualizer viz(store_a, store_b, g_run,
+                        current_grain_id, current_bank,
+                        gain_change_pending,
+                        crossfade_pos,
+                        bank_menu_mtx, bank_menu_disp,
+                        toast_mtx, toast_disp);
+
     const size_t pt_rb_capacity = samples_per_period * 8;
     RingBuffer<int16_t> pt_rb(pt_rb_capacity);
     std::mutex pt_rb_mtx;
@@ -171,9 +343,7 @@ int main(int argc, char** argv) {
         uint64_t samples_since_epoch = 0;
         bool was_recording = false;
 
-        // live feature analysis: accumulates directly from capture into a local buffer,
-        // no mutex needed — only the capture thread reads/writes this
-        const size_t kLiveFrames  = kFFTSize;  // 1024 frames
+        const size_t kLiveFrames  = kFFTSize;
         const size_t kLiveSamples = kLiveFrames * channels;
         std::vector<int16_t> live_buf(kLiveSamples, 0);
         size_t live_fill = 0;
@@ -181,6 +351,29 @@ int main(int argc, char** argv) {
         RMSAnalyzer              live_rms_an;
         SpectralRolloffAnalyzer  live_rolloff_an;
         TonalAlignmentAnalyzer   live_tonal_an;
+
+        struct BiquadHP {
+            float b0, b1, b2, a1, a2;
+            float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+            void init(float fc, float fs) {
+                float w0    = 2.0f * 3.14159265f * fc / fs;
+                float cw    = std::cos(w0);
+                float alpha = std::sin(w0) / (2.0f * 0.7071f);
+                float a0    = 1.0f + alpha;
+                b0 =  (1.0f + cw) / 2.0f / a0;
+                b1 = -(1.0f + cw)        / a0;
+                b2 =  (1.0f + cw) / 2.0f / a0;
+                a1 = -2.0f * cw          / a0;
+                a2 =  (1.0f - alpha)     / a0;
+            }
+            float process(float x) {
+                float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+                x2 = x1; x1 = x; y2 = y1; y1 = y;
+                return y;
+            }
+        } hpf_L, hpf_R;
+        hpf_L.init(50.0f, (float)rate);
+        hpf_R.init(50.0f, (float)rate);
 
         while (g_run.load(std::memory_order_relaxed)) {
             snd_pcm_sframes_t n = snd_pcm_readi(cap, in.data(), period_frames);
@@ -190,7 +383,6 @@ int main(int argc, char** argv) {
 
             bool rec = record_enabled.load(std::memory_order_relaxed);
 
-            // detect recording start: reset epoch accounting
             if (rec && !was_recording) {
                 samples_since_epoch = 0;
                 rb_epoch.store(0, std::memory_order_release);
@@ -199,41 +391,46 @@ int main(int argc, char** argv) {
 
             const size_t nsamp = (size_t)n * channels;
 
-            // always feed passthrough buffer regardless of record state
-            {
-                std::lock_guard<std::mutex> lk(pt_rb_mtx);
-                pt_rb.write_overwrite(in.data(), nsamp);
-            }
-
-            // accumulate capture samples into live_buf; analyze when full
             {
                 size_t to_copy = std::min(nsamp, kLiveSamples - live_fill);
                 std::memcpy(live_buf.data() + live_fill, in.data(), to_copy * sizeof(int16_t));
                 live_fill += to_copy;
             }
+
+            if (hpf_enabled.load(std::memory_order_relaxed)) {
+                static constexpr float kSoftGain = 4.0f;
+                for (snd_pcm_sframes_t i = 0; i < n; ++i) {
+                    float L = hpf_L.process((float)in[i * 2])     * kSoftGain;
+                    float R = hpf_R.process((float)in[i * 2 + 1]) * kSoftGain;
+                    in[i * 2]     = (int16_t)(L >  32767 ?  32767 : L < -32768 ? -32768 : L);
+                    in[i * 2 + 1] = (int16_t)(R >  32767 ?  32767 : R < -32768 ? -32768 : R);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(pt_rb_mtx);
+                pt_rb.write_overwrite(in.data(), nsamp);
+            }
+
             if (live_fill >= kLiveSamples) {
                 live_fill = 0;
-                if (true) {
-                    SliceCandidate lc;
-                    lc.window   = live_buf.data();
-                    lc.channels = channels;
-                    lc.rate     = rate;
-                    lc.region   = {0, kLiveFrames};
-                    live_s2m.process(lc);
-                    live_rms_an.analyze(lc);
-                    // always update rms so silence gate in playback thread tracks current level
-                    live_rms.store(lc.features.rms, std::memory_order_relaxed);
-                    if (lc.features.rms >= 0.01f) {
-                        // only update tonal/rolloff when signal is present (meaningless on silence)
-                        live_rolloff_an.analyze(lc);
-                        live_tonal_an.root_idx   = tonal_root_idx.load(std::memory_order_relaxed);
-                        live_tonal_an.scale_type = tonal_minor.load(std::memory_order_relaxed)
-                                                    ? ScaleType::Minor : ScaleType::Major;
-                        live_tonal_an.analyze(lc);
-                        live_tonal.store(lc.features.tonal_alignment_score, std::memory_order_relaxed);
-                        live_rolloff.store(lc.features.rolloff_freq, std::memory_order_relaxed);
-                        live_valid.store(true, std::memory_order_release);
-                    }
+                SliceCandidate lc;
+                lc.window   = live_buf.data();
+                lc.channels = channels;
+                lc.rate     = rate;
+                lc.region   = {0, kLiveFrames};
+                live_s2m.process(lc);
+                live_rms_an.analyze(lc);
+                live_rms.store(lc.features.rms, std::memory_order_relaxed);
+                if (lc.features.rms >= 0.01f) {
+                    live_rolloff_an.analyze(lc);
+                    live_tonal_an.root_idx   = tonal_root_idx.load(std::memory_order_relaxed);
+                    live_tonal_an.scale_type = tonal_minor.load(std::memory_order_relaxed)
+                                                ? ScaleType::Minor : ScaleType::Major;
+                    live_tonal_an.analyze(lc);
+                    live_tonal.store(lc.features.tonal_alignment_score, std::memory_order_relaxed);
+                    live_rolloff.store(lc.features.rolloff_freq, std::memory_order_relaxed);
+                    live_valid.store(true, std::memory_order_release);
                 }
             }
 
@@ -244,7 +441,6 @@ int main(int argc, char** argv) {
                 rb.write_overwrite(in.data(), nsamp);
             }
 
-            // epoch accounting
             samples_since_epoch += nsamp;
             while (samples_since_epoch >= rb_capacity_samples) {
                 samples_since_epoch -= rb_capacity_samples;
@@ -277,21 +473,14 @@ int main(int argc, char** argv) {
                         one_sec_window.data(), got, channels, rate
                     );
 
-                    // build initial candidate list from raw slice regions
                     std::vector<SliceCandidate> slice_candidates;
                     slice_candidates.reserve(regions.size());
                     for (auto& region : regions) {
                         slice_candidates.push_back(SliceCandidate{
-                            region,
-                            one_sec_window.data(),
-                            channels,
-                            rate,
-                            {} // features populated below
+                            region, one_sec_window.data(), channels, rate, {}
                         });
                     }
 
-                    // ---- preprocessing stage ----
-                    // each preprocessor may modify a candidate's region or discard it
                     for (auto& pre : preprocessors) {
                         std::vector<SliceCandidate> surviving;
                         surviving.reserve(slice_candidates.size());
@@ -301,16 +490,12 @@ int main(int argc, char** argv) {
                         slice_candidates = std::move(surviving);
                     }
 
-                    // ---- feature analysis stage ----
-                    // each analyzer populates fields in candidate.features
                     for (auto& c : slice_candidates) {
                         for (auto& an : analyzers) {
                             an->analyze(c);
                         }
                     }
 
-                    // ---- filter stage ----
-                    // discard candidates that fail any filter
                     for (auto& filt : filters) {
                         std::vector<SliceCandidate> surviving;
                         surviving.reserve(slice_candidates.size());
@@ -320,19 +505,24 @@ int main(int argc, char** argv) {
                         slice_candidates = std::move(surviving);
                     }
 
-                    // ---- commit surviving candidates to store ----
                     for (auto& c : slice_candidates) {
-                        size_t start_sample = c.region.start_frame * channels;
+                        size_t start_sample    = c.region.start_frame * channels;
                         size_t n_samples_slice = c.region.length_frames * channels;
 
-                        int id = store.add_slice(
+                        // route to record target bank
+                        SliceStore& target = (record_target.load(std::memory_order_relaxed) == 0)
+                                             ? store_a : store_b;
+                        int id = target.add_slice(
                             c.window + start_sample,
                             (uint32_t)n_samples_slice,
                             c.features
                         );
 
-                        std::fprintf(stderr, "[slice] id=%d start=%.1fms len=%zu samples\n",
-                            id, 1000.0 * c.region.start_frame / rate, n_samples_slice);
+                        new_slice_signal.fetch_add(1, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[slice] id=%d bank=%c start=%.1fms len=%zu samples\n",
+                            id,
+                            (record_target.load() == 0) ? 'A' : 'B',
+                            1000.0 * c.region.start_frame / rate, n_samples_slice);
                     }
                 }
 
@@ -349,22 +539,19 @@ int main(int argc, char** argv) {
         std::vector<int32_t> mix(samples_per_period, 0);
         std::vector<int16_t> pt_buf(samples_per_period, 0);
 
-        // voice pool for overlapping grain playback
         const int MAX_VOICES = 30;
         struct GrainVoice {
-            Slice slice;
-            uint32_t pos;
-            uint32_t play_end;
-            bool active;
-            float attack_frac;  // fraction of play_end spent in attack ramp
-            float decay_frac;   // fraction of play_end spent in decay ramp
+            Slice       slice;
+            SliceStore* src;        // which store's corpus to read from
+            uint32_t    pos;
+            uint32_t    play_end;
+            bool        active;
+            float       attack_frac;
+            float       decay_frac;
         };
         GrainVoice voices[MAX_VOICES] = {};
+        for (auto& v : voices) v.src = &store_a;  // safe default
 
-        // envelope shape presets: {attack_frac, decay_frac}
-        // shape 0 (percussive): short attack, long decay ramp
-        // shape 1 (sustained):  short attack, sustain plateau, short decay
-        // shape 2 (swell):      long attack ramp, short decay
         struct EnvPreset { float attack; float decay; };
         const EnvPreset kEnvShapes[3] = {
             {0.05f, 0.95f},
@@ -375,11 +562,51 @@ int main(int argc, char** argv) {
 
         uint32_t rng = 0x12345678u;
 
-        // master output envelope: ramps up on signal, decays slowly on silence
-        // per-period increments at 256 frames / 48kHz ≈ 5.3ms per period
+        // reverb + ping-pong delay state
+        static constexpr size_t kDelayL = 14400;
+        static constexpr size_t kDelayR = 21600;
+        std::vector<float> dly_L(kDelayL, 0.0f), dly_R(kDelayR, 0.0f);
+        size_t dly_wL = 0, dly_wR = 0;
+        size_t dly_fill_L = 0, dly_fill_R = 0;
+
+        struct CombFilter {
+            std::vector<float> buf;
+            size_t w = 0;
+            void init(size_t n) { buf.assign(n, 0.0f); }
+            float process(float x, float fb) {
+                float y = buf[w];
+                buf[w] = x + y * fb;
+                if (++w >= buf.size()) w = 0;
+                return y;
+            }
+        };
+        struct AllpassFilter {
+            std::vector<float> buf;
+            size_t w = 0;
+            const float g = 0.5f;
+            void init(size_t n) { buf.assign(n, 0.0f); }
+            float process(float x) {
+                float d = buf[w];
+                float y = -g * x + d;
+                buf[w] = x + g * d;
+                if (++w >= buf.size()) w = 0;
+                return y;
+            }
+        };
+
+        const size_t kCombs[4] = {2473, 2767, 3109, 3557};
+        CombFilter    combs_L[4], combs_R[4];
+        AllpassFilter aps_L[2],   aps_R[2];
+        for (int i = 0; i < 4; i++) {
+            combs_L[i].init(kCombs[i]);
+            combs_R[i].init(kCombs[i] + 23 * (i + 1));
+        }
+        aps_L[0].init(480); aps_L[1].init(161);
+        aps_R[0].init(500); aps_R[1].init(171);
+
         float master_env = 0.0f;
-        static constexpr float kMasterAttack  = 0.10f;   // ~53ms to full
-        static constexpr float kMasterRelease = 0.008f;  // ~660ms tail
+        static constexpr float kMasterAttack  = 0.10f;
+        static constexpr float kMasterRelease = 0.008f;
 
         auto next_switch = std::chrono::steady_clock::now();
 
@@ -397,7 +624,6 @@ int main(int argc, char** argv) {
                 got = 0;
             }
             else if (rec) {
-                // monitor mode: peek from ring buffer with delay
                 if (rb_mtx.try_lock()) {
                     const size_t delay = samples_per_period * 2;
                     got = rb.copy_latest(out.data(), samples_per_period, delay);
@@ -407,49 +633,64 @@ int main(int argc, char** argv) {
                 }
             }
             else {
-                // grains mode: overlapping random slice playback
                 auto now = std::chrono::steady_clock::now();
-                // silence gate: don't trigger new grains when live input is quiet
                 bool live_active = !live_valid.load(std::memory_order_acquire)
                                    || live_rms.load(std::memory_order_relaxed) >= 0.01f;
                 if (now >= next_switch && live_active) {
                     rng = xorshift32(rng);
+
+                    // probabilistic crossfade: roll dice, pick from one bank, fallback to other
+                    float cf   = crossfade_pos.load(std::memory_order_relaxed);
+                    float roll = (float)(rng % 10000) / 10000.0f;
+                    SliceStore* pick_store     = (roll < cf) ? &store_b : &store_a;
+                    SliceStore* fallback_store = (roll < cf) ? &store_a : &store_b;
+
                     int new_id = -1;
+                    SliceStore* chosen_store = nullptr;
                     bool found_id = false;
+
+                    float lt  = live_tonal.load(std::memory_order_relaxed);
+                    float lr  = live_rolloff.load(std::memory_order_relaxed);
+                    float lrm = live_rms.load(std::memory_order_relaxed);
+                    int   gk  = grain_k.load(std::memory_order_relaxed);
+
                     if (live_valid.load(std::memory_order_acquire)) {
-                        found_id = store.closest_k_id(
-                            live_tonal.load(std::memory_order_relaxed),
-                            live_rolloff.load(std::memory_order_relaxed),
-                            live_rms.load(std::memory_order_relaxed),
-                            grain_k.load(std::memory_order_relaxed),
-                            rng, new_id);
+                        if (pick_store->closest_k_id(lt, lr, lrm, gk, rng, new_id)) {
+                            found_id = true; chosen_store = pick_store;
+                        } else if (fallback_store->closest_k_id(lt, lr, lrm, gk, rng, new_id)) {
+                            found_id = true; chosen_store = fallback_store;
+                        }
                     }
-                    if (!found_id) found_id = store.random_id(rng, new_id);
-                    if (found_id) {
+                    if (!found_id) {
+                        if (pick_store->random_id(rng, new_id)) {
+                            found_id = true; chosen_store = pick_store;
+                        } else if (fallback_store->random_id(rng, new_id)) {
+                            found_id = true; chosen_store = fallback_store;
+                        }
+                    }
+
+                    if (found_id && chosen_store) {
                         Slice tmp;
-                        if (store.get(new_id, tmp)) {
-                            // per-grain jitter: ±25% of glen_ms at grain start
+                        if (chosen_store->get(new_id, tmp)) {
                             rng = xorshift32(rng);
                             int jitter_range = glen_ms / 4;
                             int jitter_ms = (jitter_range > 0)
-                                ? (int)(rng % (2 * jitter_range + 1)) - jitter_range
-                                : 0;
+                                ? (int)(rng % (2 * jitter_range + 1)) - jitter_range : 0;
                             int actual_ms = std::max(20, glen_ms + jitter_ms);
                             uint32_t play_end = std::min(
                                 (uint32_t)((uint64_t)rate * channels * actual_ms / 1000),
                                 tmp.length);
 
-                            // interpolate envelope shape between the three presets
                             float ep = std::max(0.0f, std::min(2.0f, env_p));
                             int   lo = (int)ep;
                             int   hi = std::min(lo + 1, 2);
-                            float t  = ep - (float)lo;
-                            float att = kEnvShapes[lo].attack * (1.0f - t) + kEnvShapes[hi].attack * t;
-                            float dec = kEnvShapes[lo].decay  * (1.0f - t) + kEnvShapes[hi].decay  * t;
+                            float t_ep = ep - (float)lo;
+                            float att = kEnvShapes[lo].attack * (1.0f - t_ep) + kEnvShapes[hi].attack * t_ep;
+                            float dec = kEnvShapes[lo].decay  * (1.0f - t_ep) + kEnvShapes[hi].decay  * t_ep;
 
-                            // round-robin voice allocation (overwrites oldest if all busy)
                             GrainVoice& v = voices[next_voice % MAX_VOICES];
                             v.slice       = tmp;
+                            v.src         = chosen_store;
                             v.pos         = 0;
                             v.play_end    = play_end;
                             v.active      = true;
@@ -457,26 +698,31 @@ int main(int argc, char** argv) {
                             v.decay_frac  = dec;
                             next_voice++;
                             current_grain_id.store(new_id, std::memory_order_relaxed);
+                            current_bank.store((chosen_store == &store_b) ? 1 : 0,
+                                               std::memory_order_relaxed);
 
                             if (expl) {
-                                std::fprintf(stderr, "[grain] id=%d slice_samples=%u jitter=%dms interval=%dms\n",
-                                    tmp.id, tmp.length, jitter_ms, interval);
+                                std::fprintf(stderr, "[grain] id=%d bank=%c slice=%u jitter=%dms interval=%dms\n",
+                                    tmp.id, (chosen_store == &store_b) ? 'B' : 'A',
+                                    tmp.length, jitter_ms, interval);
                             }
                         }
                     }
                     next_switch = now + std::chrono::milliseconds(interval);
                 }
 
-                // mix all active voices into int32 accumulator, then clamp to int16
                 std::fill(mix.begin(), mix.end(), 0);
                 {
-                    std::lock_guard<std::mutex> lk(store.mtx);
+                    // lock both stores for the entire mixing loop
+                    std::lock_guard<std::mutex> la(store_a.mtx);
+                    std::lock_guard<std::mutex> lb(store_b.mtx);
                     for (auto& v : voices) {
                         if (!v.active) continue;
                         uint32_t remain = (v.pos < v.play_end) ? (v.play_end - v.pos) : 0;
                         uint32_t take = std::min(remain, (uint32_t)samples_per_period);
                         if (take > 0) {
-                            const int16_t* base = store.corpus.data() + v.slice.corpus_start;
+                            const int16_t* base = v.src->corpus.data() + v.slice.corpus_start;
+                            bool mono_grain = mono_passthrough.load(std::memory_order_relaxed);
                             for (uint32_t i = 0; i < take; i++) {
                                 float grain_t = (float)(v.pos + i) / (float)v.play_end;
                                 float env;
@@ -487,14 +733,15 @@ int main(int argc, char** argv) {
                                 } else {
                                     env = 1.0f;
                                 }
-                                mix[i] += (int32_t)((float)base[v.pos + i] * env * v.slice.features.gain);
+                                uint32_t src = (mono_grain && (i % 2 == 1)) ? (v.pos + i - 1) : (v.pos + i);
+                                mix[i] += (int32_t)((float)base[src] * env * v.slice.features.gain);
                             }
                             v.pos += take;
                         }
                         if (v.pos >= v.play_end) v.active = false;
                     }
                 }
-                // advance master envelope toward target (1 when active, 0 when silent)
+
                 float env_target = live_active ? 1.0f : 0.0f;
                 float env_step   = live_active ? kMasterAttack : kMasterRelease;
                 if (master_env < env_target) {
@@ -514,20 +761,63 @@ int main(int argc, char** argv) {
                 std::fill(out.begin() + got, out.end(), 0);
             }
 
-            // passthrough: crossfade dry (live) and wet (grains)
-            // dry_wet: 0.0=all dry  1.0=all grains
-            if (passthrough_enabled.load(std::memory_order_relaxed)) {
-                float dw = dry_wet.load(std::memory_order_relaxed);
+            {
+                float dw   = dry_wet.load(std::memory_order_relaxed);
+                bool  mono = mono_passthrough.load(std::memory_order_relaxed);
                 size_t pt_got = 0;
                 {
                     std::lock_guard<std::mutex> lk(pt_rb_mtx);
                     pt_got = pt_rb.copy_latest(pt_buf.data(), samples_per_period, samples_per_period * 2);
                 }
-                for (size_t i = 0; i < samples_per_period; i++) {
-                    float dry_s = (i < pt_got) ? (float)pt_buf[i] * (1.0f - dw) : 0.0f;
-                    float wet_s = (float)out[i] * dw;
-                    int32_t s = (int32_t)(dry_s + wet_s);
-                    out[i] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
+                for (size_t i = 0; i < samples_per_period; i += 2) {
+                    float dry_L = (i     < pt_got) ? (float)pt_buf[i]     * (1.0f - dw) : 0.0f;
+                    float dry_R = (i + 1 < pt_got) ? (float)pt_buf[i + 1] * (1.0f - dw) : 0.0f;
+                    if (mono) dry_R = dry_L;
+                    float wet_L = (float)out[i]     * dw;
+                    float wet_R = (float)out[i + 1] * dw;
+                    int32_t sL = (int32_t)(dry_L + wet_L);
+                    int32_t sR = (int32_t)(dry_R + wet_R);
+                    out[i]     = (int16_t)(sL > 32767 ? 32767 : sL < -32768 ? -32768 : sL);
+                    out[i + 1] = (int16_t)(sR > 32767 ? 32767 : sR < -32768 ? -32768 : sR);
+                }
+            }
+
+            // reverb + ping-pong delay send
+            float fx = fx_amount.load(std::memory_order_relaxed);
+            if (fx > 0.005f) {
+                float delay_fb     = fx * 0.65f;
+                float reverb_decay = 0.5f + fx * 0.45f;
+
+                for (size_t i = 0; i < samples_per_period; i += 2) {
+                    float inL  = (float)out[i];
+                    float inR  = (float)out[i + 1];
+                    float mono = (inL + inR) * 0.5f;
+
+                    float dL = (dly_fill_L >= kDelayL) ? dly_L[dly_wL] : 0.0f;
+                    float dR = (dly_fill_R >= kDelayR) ? dly_R[dly_wR] : 0.0f;
+                    dly_L[dly_wL] = mono + dR * delay_fb;
+                    dly_R[dly_wR] = dL;
+                    if (++dly_wL >= kDelayL) dly_wL = 0;
+                    if (++dly_wR >= kDelayR) dly_wR = 0;
+                    if (dly_fill_L < kDelayL) ++dly_fill_L;
+                    if (dly_fill_R < kDelayR) ++dly_fill_R;
+
+                    float rvL = 0.0f, rvR = 0.0f;
+                    for (int c = 0; c < 4; c++) {
+                        rvL += combs_L[c].process(mono, reverb_decay);
+                        rvR += combs_R[c].process(mono, reverb_decay);
+                    }
+                    float rv_norm = (1.0f - reverb_decay) * 0.25f;
+                    rvL = aps_L[1].process(aps_L[0].process(rvL * rv_norm));
+                    rvR = aps_R[1].process(aps_R[0].process(rvR * rv_norm));
+
+                    float wetL = (dL + rvL) * fx * 0.5f;
+                    float wetR = (dR + rvR) * fx * 0.5f;
+
+                    int32_t sL = (int32_t)out[i]     + (int32_t)wetL;
+                    int32_t sR = (int32_t)out[i + 1] + (int32_t)wetR;
+                    out[i]     = (int16_t)(sL >  32767 ?  32767 : sL < -32768 ? -32768 : sL);
+                    out[i + 1] = (int16_t)(sR >  32767 ?  32767 : sR < -32768 ? -32768 : sR);
                 }
             }
 
@@ -564,17 +854,13 @@ int main(int argc, char** argv) {
             return val;
         };
 
-        // all GPA pins as inputs (all encoder A/B lines)
-        i2c_write_reg(0x00, 0xFF);        // IODIRA
-        i2c_write_reg(0x01, 0xFF);        // IODIRB
-        // pull-ups on all 8 GPA encoder pins and 4 button pins (GPB0,1,2,3)
-        i2c_write_reg(0x0C, 0xFF);        // GPPUA: GPA0-7
-        i2c_write_reg(0x0D, 0b00001111);  // GPPUB: GPB0,1,2,3
+        i2c_write_reg(0x00, 0xFF);
+        i2c_write_reg(0x01, 0xFF);
+        i2c_write_reg(0x0C, 0xFF);
+        i2c_write_reg(0x0D, 0b00001111);
 
-        // A-pin bit positions in port_a (odd bits), B-pin (even bits below each A)
         static constexpr uint8_t kABit[4] = { 7, 5, 3, 1 };
         static constexpr uint8_t kBBit[4] = { 6, 4, 2, 0 };
-        // button bit positions in port_b
         static constexpr uint8_t kBtnBit[4] = { 0, 1, 2, 3 };
 
         uint8_t init_a = i2c_read_reg(0x12);
@@ -582,43 +868,248 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 4; i++)
             prev_a[i] = (init_a >> kABit[i]) & 1;
 
-        int      counters[4]  = {};
-        uint8_t  prev_btn_raw = 0xFF;  // all released (pulled high)
+        int     counters[4]  = {};
+        uint8_t prev_btn_raw = 0xFF;
+
+        // enc4 long-press detection
+        auto enc4_press_start = std::chrono::steady_clock::time_point{};
+        bool enc4_was_down    = false;
+
+        // local menu state (encoder thread is the sole writer)
+        BankMenuDisplay menu;
+        std::string cur_bank_a_file;  // tracks which file slot A is saved as
+        std::string cur_bank_b_file;
 
         while (g_run.load(std::memory_order_relaxed)) {
-            uint8_t port_a = i2c_read_reg(0x12);  // GPIOA
-            uint8_t port_b = i2c_read_reg(0x13);  // GPIOB
+            // sync local menu state with any external changes (e.g. mbtn back press)
+            {
+                std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                if (menu.open && !bank_menu_disp.open) {
+                    menu.open = false;
+                } else if (menu.open && bank_menu_disp.page != menu.page) {
+                    menu.page   = bank_menu_disp.page;
+                    menu.cursor = bank_menu_disp.cursor;
+                }
+            }
 
-            // decode all four encoders
+            uint8_t port_a = i2c_read_reg(0x12);
+            uint8_t port_b = i2c_read_reg(0x13);
+
+            // decode all four encoders, compute deltas
+            int deltas[4] = {};
             for (int i = 0; i < 4; i++) {
                 uint8_t a = (port_a >> kABit[i]) & 1;
                 uint8_t b = (port_a >> kBBit[i]) & 1;
                 if (a != prev_a[i]) {
-                    counters[i] += (a == 1) ? (b == 0 ? -1 : 1)
-                                            : (b == 1 ? -1 : 1);
-                    std::fprintf(stderr, "[encoder%d] counter=%d\n", i + 1, counters[i]);
+                    int d = (a == 1) ? (b == 0 ? -1 : 1) : (b == 1 ? -1 : 1);
+                    counters[i] += d;
+                    deltas[i] = d;
                     prev_a[i] = a;
                 }
             }
 
-            // check all four buttons
-            for (int i = 0; i < 4; i++) {
+            // enc4 rotation: navigate menu when open
+            if (deltas[3] != 0) {
+                if (menu.open) {
+                    int max_items = 0;
+                    if (menu.page == 0) max_items = 10;
+                    else if (menu.page == 1 || menu.page == 2)
+                        max_items = (int)menu.file_list.size();
+                    if (max_items > 0) {
+                        menu.cursor = (menu.cursor + deltas[3] + max_items) % max_items;
+                        std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                        bank_menu_disp.cursor = menu.cursor;
+                    }
+                } else {
+                    std::fprintf(stderr, "[encoder4] counter=%d\n", counters[3]);
+                }
+            }
+            // enc1-3 deltas: just print
+            for (int i = 0; i < 3; i++) {
+                if (deltas[i] != 0)
+                    std::fprintf(stderr, "[encoder%d] counter=%d\n", i + 1, counters[i]);
+            }
+
+            // enc1-3 buttons: print only
+            for (int i = 0; i < 3; i++) {
                 uint8_t mask = 1u << kBtnBit[i];
                 uint8_t cur  = port_b  & mask;
                 uint8_t prev = prev_btn_raw & mask;
                 if (cur != prev) {
-                    std::fprintf(stderr, "[encoder%d] button=%s\n",
-                        i + 1, cur == 0 ? "pressed" : "released");
+                    bool pressed = (cur == 0);
+                    std::fprintf(stderr, "[encoder%d] button=%s\n", i + 1, pressed ? "pressed" : "released");
                 }
             }
-            prev_btn_raw = port_b;
 
+            // enc4 button: long-press = bank menu, short-press = gain confirm / menu advance
+            {
+                uint8_t mask = 1u << kBtnBit[3];
+                bool enc4_down = (port_b & mask) == 0;  // active low
+
+                if (enc4_down && !enc4_was_down) {
+                    enc4_press_start = std::chrono::steady_clock::now();
+                    enc4_was_down    = true;
+                }
+                if (!enc4_down && enc4_was_down) {
+                    enc4_was_down = false;
+                    auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - enc4_press_start).count();
+
+                    if (held_ms >= 500) {
+                        // long press: toggle bank menu
+                        menu.open = !menu.open;
+                        if (menu.open) {
+                            menu.page   = 0;
+                            menu.cursor = 0;
+                            menu.bank_name_a    = bank_name_a;
+                            menu.bank_name_b    = bank_name_b;
+                            menu.record_target  = record_target.load();
+                            menu.file_list.clear();
+                            std::fprintf(stderr, "[menu] opened\n");
+                        } else {
+                            std::fprintf(stderr, "[menu] closed\n");
+                        }
+                        std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                        bank_menu_disp = menu;
+                    } else {
+                        // short press
+                        if (menu.open) {
+                            // advance / select current item
+                            if (menu.page == 0) {
+                                switch (menu.cursor) {
+                                    case 0: case 1: break;  // label items — no-op
+                                    case 2:  // Load -> A
+                                        menu.page = 1;
+                                        menu.cursor = 0;
+                                        menu.file_list = list_banks();
+                                        break;
+                                    case 3:  // Load -> B
+                                        menu.page = 2;
+                                        menu.cursor = 0;
+                                        menu.file_list = list_banks();
+                                        break;
+                                    case 4: {  // Save A as new
+                                        std::string fname = timestamp_name();
+                                        std::string path  = banks_dir() + fname;
+                                        std::string disp  = fname.substr(0, fname.size() - 5);
+                                        if (save_bank(store_a, path, disp)) {
+                                            bank_name_a = disp;
+                                            cur_bank_a_file = fname;
+                                            menu.bank_name_a = disp;
+                                            save_config(cur_bank_a_file, cur_bank_b_file,
+                                                        record_target.load());
+                                            std::fprintf(stderr, "[bank] saved A: %s\n", fname.c_str());
+                                        }
+                                        break;
+                                    }
+                                    case 5: {  // Save B as new
+                                        std::string fname = timestamp_name();
+                                        std::string path  = banks_dir() + fname;
+                                        std::string disp  = fname.substr(0, fname.size() - 5);
+                                        if (save_bank(store_b, path, disp)) {
+                                            bank_name_b = disp;
+                                            cur_bank_b_file = fname;
+                                            menu.bank_name_b = disp;
+                                            save_config(cur_bank_a_file, cur_bank_b_file,
+                                                        record_target.load());
+                                            std::fprintf(stderr, "[bank] saved B: %s\n", fname.c_str());
+                                        }
+                                        break;
+                                    }
+                                    case 6:  // Clear A
+                                        menu.page   = 3;
+                                        menu.cursor = 0;
+                                        break;
+                                    case 7:  // Clear B
+                                        menu.page   = 4;
+                                        menu.cursor = 0;
+                                        break;
+                                    case 8: {  // Record target toggle
+                                        int rt = record_target.load();
+                                        rt = 1 - rt;
+                                        record_target.store(rt);
+                                        menu.record_target = rt;
+                                        std::fprintf(stderr, "[bank] record target -> %c\n", rt == 0 ? 'A' : 'B');
+                                        break;
+                                    }
+                                    case 9:  // Exit
+                                        menu.open = false;
+                                        std::fprintf(stderr, "[menu] closed\n");
+                                        break;
+                                }
+                            } else if (menu.page == 1 || menu.page == 2) {
+                                // load selected file
+                                if (!menu.file_list.empty()) {
+                                    std::string fname = menu.file_list[menu.cursor];
+                                    std::string path  = banks_dir() + fname;
+                                    std::string loaded_name;
+                                    SliceStore& target = (menu.page == 1) ? store_a : store_b;
+                                    if (load_bank(target, path, loaded_name)) {
+                                        if (menu.page == 1) {
+                                            bank_name_a = loaded_name;
+                                            cur_bank_a_file = fname;
+                                            menu.bank_name_a = loaded_name;
+                                        } else {
+                                            bank_name_b = loaded_name;
+                                            cur_bank_b_file = fname;
+                                            menu.bank_name_b = loaded_name;
+                                        }
+                                        save_config(cur_bank_a_file, cur_bank_b_file,
+                                                    record_target.load());
+                                        std::fprintf(stderr, "[bank] loaded slot %c: %s\n",
+                                            (menu.page == 1) ? 'A' : 'B', fname.c_str());
+                                    }
+                                }
+                                menu.page   = 0;
+                                menu.cursor = 0;
+                            } else if (menu.page == 3) {
+                                // confirm clear A
+                                {
+                                    std::lock_guard<std::mutex> lk(store_a.mtx);
+                                    store_a.corpus.clear();
+                                    store_a.slices.clear();
+                                    store_a.next_id = 0;
+                                }
+                                bank_name_a = "";
+                                cur_bank_a_file = "";
+                                menu.bank_name_a = "";
+                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                std::fprintf(stderr, "[bank] cleared slot A\n");
+                                menu.page   = 0;
+                                menu.cursor = 0;
+                            } else if (menu.page == 4) {
+                                // confirm clear B
+                                {
+                                    std::lock_guard<std::mutex> lk(store_b.mtx);
+                                    store_b.corpus.clear();
+                                    store_b.slices.clear();
+                                    store_b.next_id = 0;
+                                }
+                                bank_name_b = "";
+                                cur_bank_b_file = "";
+                                menu.bank_name_b = "";
+                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                std::fprintf(stderr, "[bank] cleared slot B\n");
+                                menu.page   = 0;
+                                menu.cursor = 0;
+                            }
+                            std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                            bank_menu_disp = menu;
+                        } else {
+                            // normal short-press: gain confirm
+                            gain_confirm.store(true, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+
+            prev_btn_raw = port_b;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         close(fd);
     });
 
-    // ---- MCP3008 potentiometer thread (bit-bang SPI: SCLK=11, MOSI=10, MISO=9, CS=25) ----
+    // ---- MCP3008 potentiometer thread ----
     std::thread mcp3008_thread([&] {
         int chip_fd = open("/dev/gpiochip4", O_RDONLY);
         if (chip_fd < 0) {
@@ -626,7 +1117,6 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // outputs: SCLK=offset[0]=11, MOSI=offset[1]=10, CS=offset[2]=25
         struct gpio_v2_line_request out_req = {};
         out_req.offsets[0] = 11;
         out_req.offsets[1] = 10;
@@ -634,7 +1124,7 @@ int main(int argc, char** argv) {
         out_req.num_lines  = 3;
         out_req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
         out_req.config.attrs[0].attr.id     = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
-        out_req.config.attrs[0].attr.values = 0b100;  // CS=1, MOSI=0, SCLK=0
+        out_req.config.attrs[0].attr.values = 0b100;
         out_req.config.attrs[0].mask        = 0b111;
         out_req.config.num_attrs = 1;
         std::strncpy(out_req.consumer, "engine-mcp-out", sizeof(out_req.consumer) - 1);
@@ -645,7 +1135,6 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // input: MISO=9
         struct gpio_v2_line_request in_req = {};
         in_req.offsets[0] = 9;
         in_req.num_lines  = 1;
@@ -660,7 +1149,6 @@ int main(int argc, char** argv) {
         }
         close(chip_fd);
 
-        // bit positions in out_req: 0=SCLK, 1=MOSI, 2=CS
         auto set_pin = [&](uint64_t bit, int val) {
             struct gpio_v2_line_values v = {};
             v.bits = val ? bit : 0;
@@ -675,27 +1163,33 @@ int main(int argc, char** argv) {
         };
 
         auto read_channel = [&](int ch) -> int {
-            set_pin(4, 0);  // CS low
+            set_pin(4, 0);
             int bits_out[] = {1, 1, (ch >> 2) & 1, (ch >> 1) & 1, ch & 1};
             for (int b : bits_out) {
-                set_pin(1, 0);  // SCLK low
-                set_pin(2, b);  // MOSI
-                set_pin(1, 1);  // SCLK high
+                set_pin(1, 0);
+                set_pin(2, b);
+                set_pin(1, 1);
             }
             int result = 0;
             for (int i = 0; i < 12; i++) {
                 set_pin(1, 0);
                 set_pin(1, 1);
-                if (i >= 2)
-                    result = (result << 1) | get_miso();
+                if (i >= 2) result = (result << 1) | get_miso();
             }
-            set_pin(1, 0);  // SCLK low
-            set_pin(4, 1);  // CS high
+            set_pin(1, 0);
+            set_pin(4, 1);
             return result;
         };
 
         int prev[8] = {};
         static constexpr int kThreshold = 8;
+
+        auto update_toast = [&](const char* name, const char* val) {
+            std::lock_guard<std::mutex> lk(toast_mtx);
+            std::strncpy(toast_disp.name,  name, 31); toast_disp.name[31]  = '\0';
+            std::strncpy(toast_disp.value, val,  31); toast_disp.value[31] = '\0';
+            toast_disp.updated = std::chrono::steady_clock::now();
+        };
 
         while (g_run.load(std::memory_order_relaxed)) {
             for (int ch = 0; ch < 8; ch++) {
@@ -703,8 +1197,68 @@ int main(int argc, char** argv) {
                 int diff = val - prev[ch];
                 if (diff < 0) diff = -diff;
                 if (diff >= kThreshold) {
-                    std::fprintf(stderr, "[pot] ch%d=%d\n", ch, val);
                     prev[ch] = val;
+                    if (ch == 0) {
+                        float s = 0.5f + (val / 1023.0f) * 9.5f;
+                        slicer_sensitivity.store(s, std::memory_order_relaxed);
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%.1f", s);
+                        update_toast("sensitivity", buf);
+                        std::fprintf(stderr, "[pot] sensitivity=%.2f\n", s);
+                    } else if (ch == 2) {
+                        float ep = val / 1023.0f * 2.0f;
+                        env_pos.store(ep, std::memory_order_relaxed);
+                        const char* name = (ep < 0.75f) ? "percussive" : (ep < 1.25f) ? "sustained" : "swell";
+                        update_toast("envelope", name);
+                        std::fprintf(stderr, "[pot] env_pos=%.2f (%s)\n", ep, name);
+                    } else if (ch == 1) {
+                        int ms = (int)(2000.0f * std::powf(15.0f / 2000.0f, val / 1023.0f));
+                        grain_interval_ms.store(ms, std::memory_order_relaxed);
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%dms", ms);
+                        update_toast("grain interval", buf);
+                        std::fprintf(stderr, "[pot] grain_interval=%dms\n", ms);
+                    } else if (ch == 3) {
+                        int ms = (int)(20.0f * std::powf(100.0f, val / 1023.0f));
+                        ms = std::min(ms, slicer->slice_ms);
+                        grain_length_ms.store(ms, std::memory_order_relaxed);
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%dms", ms);
+                        update_toast("grain length", buf);
+                        std::fprintf(stderr, "[pot] grain_length=%dms\n", ms);
+                    } else if (ch == 5) {
+                        // scale k with combined corpus size across both banks
+                        size_t n = 0;
+                        if (store_a.mtx.try_lock()) { n += store_a.slices.size(); store_a.mtx.unlock(); }
+                        if (store_b.mtx.try_lock()) { n += store_b.slices.size(); store_b.mtx.unlock(); }
+                        float max_k = std::max(2.0f, n * 0.5f);
+                        int k = std::max(1, (int)std::powf(max_k, val / 1023.0f));
+                        grain_k.store(k, std::memory_order_relaxed);
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%d", k);
+                        update_toast("grain neighbors", buf);
+                        std::fprintf(stderr, "[pot] grain_k=%d (corpus=%zu)\n", k, n);
+                    } else if (ch == 4) {
+                        float fx = val / 1023.0f;
+                        fx_amount.store(fx, std::memory_order_relaxed);
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%.0f%%", fx * 100.0f);
+                        update_toast("reverb/delay", buf);
+                        std::fprintf(stderr, "[pot] fx=%.2f\n", fx);
+                    } else if (ch == 6) {
+                        float dw = val / 1023.0f;
+                        dry_wet.store(dw, std::memory_order_relaxed);
+                        char buf[32];
+                        if (dw < 0.02f)       std::snprintf(buf, sizeof(buf), "dry");
+                        else if (dw > 0.98f)  std::snprintf(buf, sizeof(buf), "wet");
+                        else                  std::snprintf(buf, sizeof(buf), "%.0f%% wet", dw * 100.0f);
+                        update_toast("dry/wet", buf);
+                        std::fprintf(stderr, "[pot] dry_wet=%.2f\n", dw);
+                    } else if (ch == 7) {
+                        float cf = 1.0f - val / 1023.0f;
+                        crossfade_pos.store(cf, std::memory_order_relaxed);
+                        char buf[32];
+                        if (cf < 0.02f)       std::snprintf(buf, sizeof(buf), "full A");
+                        else if (cf > 0.98f)  std::snprintf(buf, sizeof(buf), "full B");
+                        else                  std::snprintf(buf, sizeof(buf), "A %.0f%%  B %.0f%%", (1.0f-cf)*100, cf*100);
+                        update_toast("crossfade", buf);
+                        std::fprintf(stderr, "[pot] crossfade=%.2f\n", cf);
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -714,16 +1268,16 @@ int main(int argc, char** argv) {
         close(in_req.fd);
     });
 
-    // ---- input gain presets (dB, PCM1863 PGA via ALSA enum control) ----
+    // ---- input gain presets ----
     static constexpr const char* kMixerCard      = "hw:2";
-    static constexpr float kGainLine_dB       =  0.0f;  // TRS line level
-    static constexpr float kGainInstrument_dB = 20.0f;  // TRS instrument level
-    static constexpr float kGainDualJack_dB   =  0.0f;  // dual jack stereo (line)
-    static constexpr float kGainMic_dB        = 30.0f;  // XLR mic mono
+    static constexpr float kGainLine_dB       =  0.0f;
+    static constexpr float kGainInstrument_dB = 40.0f;
+    static constexpr float kGainDualJack_dB   =  0.0f;
+    static constexpr float kGainMic_dB        = 30.0f;
 
     std::atomic<int> current_input_mode{-1};
 
-    // ---- rotary switch thread (GPIO 5 + 6 direct to Pi) ----
+    // ---- rotary switch thread ----
     std::thread switch_thread([&] {
         int chip_fd = open("/dev/gpiochip4", O_RDONLY);
         if (chip_fd < 0) {
@@ -746,6 +1300,8 @@ int main(int argc, char** argv) {
         close(chip_fd);
 
         int prev_mode = -1;
+        auto gain_settled_at = std::chrono::steady_clock::now();
+        static constexpr int kSettleMs = 1500;
 
         while (g_run.load(std::memory_order_relaxed)) {
             struct gpio_v2_line_values vals = {};
@@ -757,7 +1313,7 @@ int main(int argc, char** argv) {
 
             int gpio5 = (vals.bits >> 0) & 1;
             int gpio6 = (vals.bits >> 1) & 1;
-            int mode  = (gpio6 << 1) | gpio5;  // 2-bit position: 0-3
+            int mode  = (gpio6 << 1) | gpio5;
 
             if (mode != prev_mode) {
                 const char* names[] = {"???", "XLR mic mono", "Dual jack stereo", "TRS stereo"};
@@ -774,50 +1330,77 @@ int main(int argc, char** argv) {
                     if (set_pga_gain_db(kMixerCard, gain))
                         std::fprintf(stderr, "[gain] set %.1fdB for mode %s\n", gain, names[mode]);
                 }
+                mono_passthrough.store(mode == 1, std::memory_order_relaxed);
+                hpf_enabled.store(mode == 1, std::memory_order_relaxed);
                 current_input_mode.store(mode, std::memory_order_relaxed);
                 prev_mode = mode;
+                gain_settled_at = std::chrono::steady_clock::now();
             }
 
-            // TRS stereo (mode 3): auto-detect instrument vs line level with hysteresis
+            auto now_sw = std::chrono::steady_clock::now();
             if (current_input_mode.load(std::memory_order_relaxed) == 3) {
-                static constexpr float kLowRms          = 0.03f;  // below = instrument level
-                static constexpr float kHighRms         = 0.08f;  // above = line level
-                static constexpr int   kHoldMs          = 3000;
-                static constexpr float kSignalPresent   = 0.01f;  // must be above this to count as signal (not silence)
-                static bool trs_instrument = false;
-                static auto low_since  = std::chrono::steady_clock::time_point{};
-                static auto high_since = std::chrono::steady_clock::time_point{};
-                static bool low_timing  = false;
-                static bool high_timing = false;
+                static constexpr float kLowRms        = 0.010f;
+                static constexpr float kHighRms       = 0.200f;
+                static constexpr int   kHoldMs        = 3000;
+                static constexpr int   kHighHoldMs    = 500;
+                static constexpr float kSignalPresent = 0.0005f;
+                static bool trs_instrument  = false;
+                static auto low_since       = std::chrono::steady_clock::time_point{};
+                static auto high_since      = std::chrono::steady_clock::time_point{};
+                static bool low_timing      = false;
+                static bool high_timing     = false;
+                static int  low_sig_count   = 0;
 
-                float rms = live_rms.load(std::memory_order_relaxed);
-                auto now = std::chrono::steady_clock::now();
-
-                if (!trs_instrument) {
-                    // currently at line gain — watch for quiet signal
-                    if (rms > kSignalPresent && rms < kLowRms) {
-                        if (!low_timing) { low_since = now; low_timing = true; }
-                        else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - low_since).count() >= kHoldMs) {
+                int pending = gain_change_pending.load(std::memory_order_relaxed);
+                if (pending != 0) {
+                    if (gain_confirm.exchange(false, std::memory_order_relaxed)) {
+                        if (pending == 1) {
                             trs_instrument = true;
-                            low_timing = false;
+                            mono_passthrough.store(true,  std::memory_order_relaxed);
+                            hpf_enabled.store(true,       std::memory_order_relaxed);
                             set_pga_gain_db(kMixerCard, kGainInstrument_dB);
-                            std::fprintf(stderr, "[gain] TRS: instrument level detected → %.1fdB\n", kGainInstrument_dB);
-                        }
-                    } else {
-                        low_timing = false;
-                    }
-                } else {
-                    // currently at instrument gain — watch for loud signal
-                    if (rms > kHighRms) {
-                        if (!high_timing) { high_since = now; high_timing = true; }
-                        else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - high_since).count() >= kHoldMs) {
+                            gain_settled_at = now_sw;
+                            std::fprintf(stderr, "[gain] confirmed → instrument %.1fdB\n", kGainInstrument_dB);
+                        } else {
                             trs_instrument = false;
-                            high_timing = false;
+                            mono_passthrough.store(false, std::memory_order_relaxed);
+                            hpf_enabled.store(false,      std::memory_order_relaxed);
                             set_pga_gain_db(kMixerCard, kGainLine_dB);
-                            std::fprintf(stderr, "[gain] TRS: line level detected → %.1fdB\n", kGainLine_dB);
+                            gain_settled_at = now_sw;
+                            std::fprintf(stderr, "[gain] confirmed → line %.1fdB\n", kGainLine_dB);
                         }
-                    } else {
+                        gain_change_pending.store(0, std::memory_order_relaxed);
+                    } else if (gain_cancel.exchange(false, std::memory_order_relaxed)) {
+                        gain_change_pending.store(0, std::memory_order_relaxed);
+                        gain_settled_at = now_sw;
+                        low_timing = false; low_sig_count = 0;
                         high_timing = false;
+                        std::fprintf(stderr, "[gain] cancelled — no change\n");
+                    }
+                }
+
+                bool settled = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now_sw - gain_settled_at).count() >= kSettleMs;
+                if (settled && pending == 0) {
+                    float rms = live_rms.load(std::memory_order_relaxed);
+                    if (!trs_instrument) {
+                        if (rms < kLowRms) {
+                            if (!low_timing) { low_since = now_sw; low_timing = true; low_sig_count = 0; }
+                            if (rms > kSignalPresent) low_sig_count++;
+                            if (low_sig_count >= 10 &&
+                                std::chrono::duration_cast<std::chrono::milliseconds>(now_sw - low_since).count() >= kHoldMs) {
+                                low_timing = false; low_sig_count = 0;
+                                gain_change_pending.store(1, std::memory_order_relaxed);
+                            }
+                        } else { low_timing = false; low_sig_count = 0; }
+                    } else {
+                        if (rms > kHighRms) {
+                            if (!high_timing) { high_since = now_sw; high_timing = true; }
+                            else if (std::chrono::duration_cast<std::chrono::milliseconds>(now_sw - high_since).count() >= kHighHoldMs) {
+                                high_timing = false;
+                                gain_change_pending.store(-1, std::memory_order_relaxed);
+                            }
+                        } else { high_timing = false; }
                     }
                 }
             }
@@ -827,8 +1410,7 @@ int main(int argc, char** argv) {
         close(req.fd);
     });
 
-    // ---- LED thread (GPIO 23 = green anode, GPIO 24 = red anode) ----
-    // recording: green on, red off  |  stopped: green off, red on
+    // ---- LED thread ----
     std::thread led_thread([&] {
         int chip_fd = open("/dev/gpiochip4", O_RDONLY);
         if (chip_fd < 0) {
@@ -837,8 +1419,8 @@ int main(int argc, char** argv) {
         }
 
         struct gpio_v2_line_request led_req = {};
-        led_req.offsets[0] = 17;  // green anode
-        led_req.offsets[1] = 27;  // red anode
+        led_req.offsets[0] = 17;
+        led_req.offsets[1] = 27;
         led_req.num_lines   = 2;
         led_req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
         std::strncpy(led_req.consumer, "engine-led", sizeof(led_req.consumer) - 1);
@@ -850,21 +1432,40 @@ int main(int argc, char** argv) {
         }
         close(chip_fd);
 
-        bool prev_rec = !record_enabled.load();  // force update on first iteration
+        int  last_signal   = new_slice_signal.load();
+        auto flash_until   = std::chrono::steady_clock::time_point{};
+        auto blink_tick    = std::chrono::steady_clock::now();
+        bool blink_state   = false;
 
         while (g_run.load(std::memory_order_relaxed)) {
-            bool rec = record_enabled.load(std::memory_order_relaxed);
-            if (rec != prev_rec) {
-                struct gpio_v2_line_values vals = {};
-                vals.mask = 0b11;
-                vals.bits = rec ? 0b01 : 0b10;  // rec: green=1 red=0 | idle: green=0 red=1
-                ioctl(led_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals);
-                prev_rec = rec;
+            bool rec     = record_enabled.load(std::memory_order_relaxed);
+            bool pending = gain_change_pending.load(std::memory_order_relaxed) != 0;
+            auto now     = std::chrono::steady_clock::now();
+
+            int sig = new_slice_signal.load(std::memory_order_relaxed);
+            if (sig != last_signal) {
+                flash_until = now + std::chrono::milliseconds(100);
+                last_signal = sig;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            struct gpio_v2_line_values vals = {};
+            vals.mask = 0b11;
+            if (pending) {
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - blink_tick).count() >= 250) {
+                    blink_state = !blink_state;
+                    blink_tick  = now;
+                }
+                vals.bits = blink_state ? 0b01 : 0b10;
+            } else if (now < flash_until) {
+                vals.bits = 0b11;
+            } else {
+                vals.bits = rec ? 0b01 : 0b10;
+            }
+            ioctl(led_req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &vals);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        // turn both off on shutdown
         struct gpio_v2_line_values off = {};
         off.mask = 0b11;
         off.bits = 0b00;
@@ -872,7 +1473,7 @@ int main(int argc, char** argv) {
         close(led_req.fd);
     });
 
-    // ---- momentary button thread (GPIO 14, active-low) ----
+    // ---- momentary button thread (GPIO 13, active-low) ----
     std::thread moment_btn_thread([&] {
         int chip_fd = open("/dev/gpiochip4", O_RDONLY);
         if (chip_fd < 0) {
@@ -905,8 +1506,21 @@ int main(int argc, char** argv) {
 
             int level = vals.bits & 1;
 
-            if (level == 0 && prev_level == 1)
+            if (level == 0 && prev_level == 1) {
                 std::fprintf(stderr, "[mbtn] pressed\n");
+                std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                if (bank_menu_disp.open) {
+                    if (bank_menu_disp.page == 0) {
+                        bank_menu_disp.open = false;
+                        std::fprintf(stderr, "[menu] closed via mbtn\n");
+                    } else {
+                        bank_menu_disp.page   = 0;
+                        bank_menu_disp.cursor = 0;
+                    }
+                } else {
+                    gain_cancel.store(true, std::memory_order_relaxed);
+                }
+            }
 
             prev_level = level;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -915,7 +1529,7 @@ int main(int argc, char** argv) {
         close(mbtn_req.fd);
     });
 
-    // ---- record button thread (GPIO 12, active-low, toggles record_enabled) ----
+    // ---- record button thread (GPIO 12) ----
     std::thread button_thread([&] {
         int chip_fd = open("/dev/gpiochip4", O_RDONLY);
         if (chip_fd < 0) {
@@ -936,7 +1550,7 @@ int main(int argc, char** argv) {
         }
         close(chip_fd);
 
-        int prev_level = 1;  // assume released (pulled high)
+        int prev_level = 1;
 
         while (g_run.load(std::memory_order_relaxed)) {
             struct gpio_v2_line_values vals = {};
@@ -948,7 +1562,6 @@ int main(int argc, char** argv) {
 
             int level = vals.bits & 1;
 
-            // falling edge = button pressed (pin pulled to GND)
             if (level == 0 && prev_level == 1) {
                 bool rec = !record_enabled.load(std::memory_order_relaxed);
                 record_enabled.store(rec, std::memory_order_relaxed);
@@ -960,11 +1573,21 @@ int main(int argc, char** argv) {
             }
 
             prev_level = level;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // debounce
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
         close(btn_req.fd);
     });
+
+    // set RT priority
+    {
+        struct sched_param sp{};
+        sp.sched_priority = 80;
+        if (pthread_setschedparam(cap_thread.native_handle(), SCHED_FIFO, &sp) != 0)
+            std::fprintf(stderr, "[rt] failed to set RT priority for cap thread (run as root?)\n");
+        if (pthread_setschedparam(pb_thread.native_handle(), SCHED_FIFO, &sp) != 0)
+            std::fprintf(stderr, "[rt] failed to set RT priority for pb thread (run as root?)\n");
+    }
 
     viz.start();
 
@@ -1005,7 +1628,8 @@ int main(int argc, char** argv) {
             }
 
             else if (k == 'l') {
-                store.list();
+                store_a.list();
+                store_b.list();
             }
 
             else if (k == 'p') {
@@ -1062,17 +1686,19 @@ int main(int argc, char** argv) {
             else if (k == 'z' || k == 'x') {
                 static const char* kNames[12] = {"A","Bb","B","C","C#","D","Eb","E","F","F#","G","Ab"};
                 int idx = (k == 'z')
-                    ? (tonal_root_idx.load() + 11) % 12   // step down
-                    : (tonal_root_idx.load() +  1) % 12;  // step up
+                    ? (tonal_root_idx.load() + 11) % 12
+                    : (tonal_root_idx.load() +  1) % 12;
                 tonal_root_idx.store(idx);
                 ScaleType sc = tonal_minor.load() ? ScaleType::Minor : ScaleType::Major;
-                {
-                    std::lock_guard<std::mutex> lk(store.mtx);
-                    for (auto& [id, slice] : store.slices)
+                auto update_store_tonal = [&](SliceStore& s) {
+                    std::lock_guard<std::mutex> lk(s.mtx);
+                    for (auto& [id, slice] : s.slices)
                         slice.features.tonal_alignment_score =
                             TonalAlignmentAnalyzer::tonal_score_from_chroma(
                                 slice.features.chroma_energy, idx, sc);
-                }
+                };
+                update_store_tonal(store_a);
+                update_store_tonal(store_b);
                 std::fprintf(stderr, "[key] tonal root=%s (%.1fHz)\n", kNames[idx], kRootFreqs[idx]);
             }
             else if (k == 'v') {
@@ -1080,13 +1706,15 @@ int main(int argc, char** argv) {
                 tonal_minor.store(minor);
                 int idx = tonal_root_idx.load();
                 ScaleType sc = minor ? ScaleType::Minor : ScaleType::Major;
-                {
-                    std::lock_guard<std::mutex> lk(store.mtx);
-                    for (auto& [id, slice] : store.slices)
+                auto update_store_tonal = [&](SliceStore& s) {
+                    std::lock_guard<std::mutex> lk(s.mtx);
+                    for (auto& [id, slice] : s.slices)
                         slice.features.tonal_alignment_score =
                             TonalAlignmentAnalyzer::tonal_score_from_chroma(
                                 slice.features.chroma_energy, idx, sc);
-                }
+                };
+                update_store_tonal(store_a);
+                update_store_tonal(store_b);
                 std::fprintf(stderr, "[key] tonal scale=%s\n", minor ? "minor" : "major");
             }
 
@@ -1108,7 +1736,7 @@ int main(int argc, char** argv) {
             else if (k == '6') { grain_interval_ms.store(15);   std::fprintf(stderr, "[key] interval=15ms\n"); }
         }
 
-        // periodic stats: cpu usage + corpus size every 5 seconds
+        // periodic stats: cpu + corpus sizes every 5s
         {
             auto now_s = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now_s - last_stats_time).count();
@@ -1116,15 +1744,23 @@ int main(int argc, char** argv) {
                 uint64_t ticks = read_cpu_ticks();
                 double cpu_pct = ((double)(ticks - last_cpu_ticks) / (double)sysconf(_SC_CLK_TCK))
                                  / elapsed * 100.0;
-                size_t corpus_samples, n_slices;
+                size_t sa_slices, sa_samp, sb_slices, sb_samp;
                 {
-                    std::lock_guard<std::mutex> lk(store.mtx);
-                    corpus_samples = store.corpus.size();
-                    n_slices       = store.slices.size();
+                    std::lock_guard<std::mutex> la(store_a.mtx);
+                    sa_slices = store_a.slices.size();
+                    sa_samp   = store_a.corpus.size();
                 }
-                std::fprintf(stderr, "[stats] cpu=%.1f%%  corpus=%zu slices / %zu samples (%.1f KB)\n",
-                    cpu_pct, n_slices, corpus_samples,
-                    corpus_samples * sizeof(int16_t) / 1024.0);
+                {
+                    std::lock_guard<std::mutex> lb(store_b.mtx);
+                    sb_slices = store_b.slices.size();
+                    sb_samp   = store_b.corpus.size();
+                }
+                std::fprintf(stderr,
+                    "[stats] cpu=%.1f%%  A=%zu slices/%.1fKB  B=%zu slices/%.1fKB  cf=%.2f\n",
+                    cpu_pct,
+                    sa_slices, sa_samp * sizeof(int16_t) / 1024.0,
+                    sb_slices, sb_samp * sizeof(int16_t) / 1024.0,
+                    crossfade_pos.load());
                 last_stats_time = now_s;
                 last_cpu_ticks  = ticks;
             }
@@ -1133,18 +1769,17 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // shutdown
     g_run.store(false);
     viz.stop();
-    if (cap_thread.joinable()) cap_thread.join();
-    if (pb_thread.joinable()) pb_thread.join();
-    if (slicer_thread.joinable()) slicer_thread.join();
-    if (encoder_thread.joinable()) encoder_thread.join();
-    if (mcp3008_thread.joinable()) mcp3008_thread.join();
+    if (cap_thread.joinable())       cap_thread.join();
+    if (pb_thread.joinable())        pb_thread.join();
+    if (slicer_thread.joinable())    slicer_thread.join();
+    if (encoder_thread.joinable())   encoder_thread.join();
+    if (mcp3008_thread.joinable())   mcp3008_thread.join();
     if (moment_btn_thread.joinable()) moment_btn_thread.join();
-    if (switch_thread.joinable()) switch_thread.join();
-    if (led_thread.joinable()) led_thread.join();
-    if (button_thread.joinable()) button_thread.join();
+    if (switch_thread.joinable())    switch_thread.join();
+    if (led_thread.joinable())       led_thread.join();
+    if (button_thread.joinable())    button_thread.join();
 
     snd_pcm_close(cap);
     snd_pcm_close(pb);

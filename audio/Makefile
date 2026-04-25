@@ -1,8 +1,8 @@
 CXX      := g++
 SDL2_CFLAGS := $(shell sdl2-config --cflags)
 SDL2_LIBS   := $(shell sdl2-config --libs)
-CXXFLAGS := -Iinclude $(SDL2_CFLAGS)
-LDFLAGS  := -lasound $(SDL2_LIBS)
+CXXFLAGS := -std=c++17 -Iinclude $(SDL2_CFLAGS)
+LDFLAGS  := -lasound $(SDL2_LIBS) -lSDL2_ttf -lstdc++fs
 
 BUILDDIR := build
 

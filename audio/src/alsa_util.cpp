@@ -99,8 +99,7 @@ bool set_pga_gain_db(const char* card, float db) {
             ok = false;
             continue;
         }
-        if (snd_mixer_selem_set_enum_item(elem, SND_MIXER_SCHN_FRONT_LEFT,  idx) < 0 ||
-            snd_mixer_selem_set_enum_item(elem, SND_MIXER_SCHN_FRONT_RIGHT, idx) < 0) {
+        if (snd_mixer_selem_set_enum_item(elem, SND_MIXER_SCHN_FRONT_LEFT, idx) < 0) {
             std::fprintf(stderr, "[gain] failed to set '%s' to index %u\n", name, idx);
             ok = false;
         }
