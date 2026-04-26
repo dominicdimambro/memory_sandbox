@@ -206,6 +206,16 @@ void GrainVisualizer::snapshot() {
     auto add_grains = [&](SliceStore& s, bool from_b,
                            std::unordered_map<int, steady_clock::time_point>& btimes) {
         if (!s.mtx.try_lock()) return;
+
+        // remove birth times for IDs no longer in the store (cleared/reloaded banks
+        // reuse IDs from 0, so stale entries would suppress the flash for new grains)
+        for (auto it = btimes.begin(); it != btimes.end(); ) {
+            if (s.slices.find(it->first) == s.slices.end())
+                it = btimes.erase(it);
+            else
+                ++it;
+        }
+
         for (auto& [id, slice] : s.slices) {
             const auto& f = slice.features;
             GrainPoint p;
@@ -243,6 +253,15 @@ void GrainVisualizer::snapshot() {
 void GrainVisualizer::render_frame() {
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
+
+    // snapshot shared menu state once per frame
+    BankMenuDisplay menu_snap;
+    bool menu_snap_ok = false;
+    if (bank_menu_mtx_.try_lock()) {
+        menu_snap     = bank_menu_disp_;
+        menu_snap_ok  = true;
+        bank_menu_mtx_.unlock();
+    }
 
     int   mode = engine_mode_.load(std::memory_order_relaxed);
     float ty, tx, zoom;
@@ -467,17 +486,25 @@ void GrainVisualizer::render_frame() {
             draw_text(e.label, lx + 28, ly, col);
             ly += 26;
         }
+
+        // recording target indicator
+        ly += 8;
+        int rec_tgt = menu_snap_ok ? menu_snap.record_target : 0;
+        // dot color matches the active bank
+        uint8_t dr = rec_tgt ? 255 :   0;
+        uint8_t dg = rec_tgt ? 150 : 200;
+        uint8_t db = rec_tgt ?   0 : 220;
+        SDL_SetRenderDrawColor(renderer_, dr, dg, db, 255);
+        SDL_Rect rec_dot = {lx + 2, ly + 5, 12, 12};
+        SDL_RenderFillRect(renderer_, &rec_dot);
+        SDL_Color rec_col = {dr, dg, db, 255};
+        draw_text(rec_tgt ? "REC > B" : "REC > A", lx + 28, ly, rec_col);
     }
 
     // bank menu overlay
     {
-        BankMenuDisplay snap;
-        bool got = false;
-        if (bank_menu_mtx_.try_lock()) {
-            snap = bank_menu_disp_;
-            got  = true;
-            bank_menu_mtx_.unlock();
-        }
+        const BankMenuDisplay& snap = menu_snap;
+        bool got = menu_snap_ok;
         if (got && snap.open && font_) {
             const int kLineH  = 26;
             const int kPanelW = std::min(420, w_ - 40);
