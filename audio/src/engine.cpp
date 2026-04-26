@@ -305,6 +305,8 @@ int main(int argc, char** argv) {
     std::mutex      bank_menu_mtx;
     std::string     bank_name_a, bank_name_b;
 
+    std::atomic<int>  delay_time_ms{300};
+
     // parameter toast (pot thread writes, visualizer reads)
     ParamToast toast_disp;
     std::mutex toast_mtx;
@@ -586,12 +588,12 @@ int main(int argc, char** argv) {
 
         uint32_t rng = 0x12345678u;
 
-        // reverb + ping-pong delay state
-        static constexpr size_t kDelayL = 14400;
-        static constexpr size_t kDelayR = 21600;
-        std::vector<float> dly_L(kDelayL, 0.0f), dly_R(kDelayR, 0.0f);
+        // reverb + ping-pong delay state (max 2s at 48kHz)
+        static constexpr size_t kMaxDelay = 96000;
+        std::vector<float> dly_L(kMaxDelay, 0.0f), dly_R(kMaxDelay, 0.0f);
         size_t dly_wL = 0, dly_wR = 0;
         size_t dly_fill_L = 0, dly_fill_R = 0;
+        int    dly_ms_cur = 300;  // tracks last applied value to detect changes
 
         struct CombFilter {
             std::vector<float> buf;
@@ -863,19 +865,32 @@ int main(int argc, char** argv) {
                 float delay_fb     = fx * 0.65f;
                 float reverb_decay = 0.5f + fx * 0.45f;
 
+                // update delay length from params; reset buffers on change
+                int dly_ms_new = delay_time_ms.load(std::memory_order_relaxed);
+                if (dly_ms_new != dly_ms_cur) {
+                    dly_ms_cur = dly_ms_new;
+                    std::fill(dly_L.begin(), dly_L.end(), 0.0f);
+                    std::fill(dly_R.begin(), dly_R.end(), 0.0f);
+                    dly_wL = dly_wR = dly_fill_L = dly_fill_R = 0;
+                }
+                size_t curDelayL = std::max(1, dly_ms_cur) * (size_t)rate / 1000;
+                size_t curDelayR = curDelayL * 3 / 2;
+                if (curDelayL > kMaxDelay) curDelayL = kMaxDelay;
+                if (curDelayR > kMaxDelay) curDelayR = kMaxDelay;
+
                 for (size_t i = 0; i < samples_per_period; i += 2) {
                     float inL  = (float)out[i];
                     float inR  = (float)out[i + 1];
                     float mono = (inL + inR) * 0.5f;
 
-                    float dL = (dly_fill_L >= kDelayL) ? dly_L[dly_wL] : 0.0f;
-                    float dR = (dly_fill_R >= kDelayR) ? dly_R[dly_wR] : 0.0f;
+                    float dL = (dly_fill_L >= curDelayL) ? dly_L[dly_wL] : 0.0f;
+                    float dR = (dly_fill_R >= curDelayR) ? dly_R[dly_wR] : 0.0f;
                     dly_L[dly_wL] = mono + dR * delay_fb;
                     dly_R[dly_wR] = dL;
-                    if (++dly_wL >= kDelayL) dly_wL = 0;
-                    if (++dly_wR >= kDelayR) dly_wR = 0;
-                    if (dly_fill_L < kDelayL) ++dly_fill_L;
-                    if (dly_fill_R < kDelayR) ++dly_fill_R;
+                    if (++dly_wL >= curDelayL) dly_wL = 0;
+                    if (++dly_wR >= curDelayR) dly_wR = 0;
+                    if (dly_fill_L < curDelayL) ++dly_fill_L;
+                    if (dly_fill_R < curDelayR) ++dly_fill_R;
 
                     float rvL = 0.0f, rvR = 0.0f;
                     for (int c = 0; c < 4; c++) {
@@ -1009,7 +1024,16 @@ int main(int argc, char** argv) {
             // enc4 rotation: navigate menu when open
             if (deltas[3] != 0) {
                 if (menu.open) {
-                    if (menu.page == 5 || menu.page == 6) {
+                    if (menu.page == 12) {
+                        // parameters page: adjust delay time
+                        int ms = delay_time_ms.load() + deltas[3] * 10;
+                        if (ms <   50) ms =   50;
+                        if (ms > 2000) ms = 2000;
+                        delay_time_ms.store(ms);
+                        menu.delay_ms = ms;
+                        std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                        bank_menu_disp.delay_ms = ms;
+                    } else if (menu.page == 5 || menu.page == 6) {
                         // name entry: cycle character at cursor
                         int pos = menu.cursor;
                         name_char_idx[pos] = ((name_char_idx[pos] + deltas[3]) % kNameCharsLen
@@ -1020,7 +1044,8 @@ int main(int argc, char** argv) {
                         bank_menu_disp.cursor = pos;
                     } else {
                         int max_items = 0;
-                        if (menu.page == 0) max_items = 13;
+                        if (menu.page == 0) max_items = 8;
+                        else if (menu.page == 10 || menu.page == 11) max_items = 4;
                         else if (menu.page == 1 || menu.page == 2)
                             max_items = (int)menu.file_list.size();
                         if (max_items > 0) {
@@ -1146,59 +1171,17 @@ int main(int argc, char** argv) {
                             // advance / select current item
                             if (menu.page == 0) {
                                 switch (menu.cursor) {
-                                    case 0: {  // Slot A — overwrite if file loaded
-                                        if (!cur_bank_a_file.empty()) {
-                                            if (save_bank(store_a, banks_dir() + cur_bank_a_file, bank_name_a)) {
-                                                menu.bank_name_a = bank_name_a;
-                                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
-                                                std::fprintf(stderr, "[bank] overwrite A: %s\n", cur_bank_a_file.c_str());
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    case 1: {  // Slot B — overwrite if file loaded
-                                        if (!cur_bank_b_file.empty()) {
-                                            if (save_bank(store_b, banks_dir() + cur_bank_b_file, bank_name_b)) {
-                                                menu.bank_name_b = bank_name_b;
-                                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
-                                                std::fprintf(stderr, "[bank] overwrite B: %s\n", cur_bank_b_file.c_str());
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    case 2:  // Load -> A
-                                        menu.page = 1;
-                                        menu.cursor = 0;
-                                        menu.file_list = list_banks();
-                                        break;
-                                    case 3:  // Load -> B
-                                        menu.page = 2;
-                                        menu.cursor = 0;
-                                        menu.file_list = list_banks();
-                                        break;
-                                    case 4:  // Save A as new → name entry
-                                        enter_name_page(5);
-                                        break;
-                                    case 5:  // Save B as new → name entry
-                                        enter_name_page(6);
-                                        break;
-                                    case 6:  // Clear A
-                                        menu.page   = 3;
-                                        menu.cursor = 0;
-                                        break;
-                                    case 7:  // Clear B
-                                        menu.page   = 4;
-                                        menu.cursor = 0;
-                                        break;
-                                    case 8: {  // Record target toggle
-                                        int rt = record_target.load();
-                                        rt = 1 - rt;
+                                    case 0:  // Bank A → sub-page
+                                        menu.page = 10; menu.cursor = 0; break;
+                                    case 1:  // Bank B → sub-page
+                                        menu.page = 11; menu.cursor = 0; break;
+                                    case 2: {  // Record target toggle
+                                        int rt = 1 - record_target.load();
                                         record_target.store(rt);
                                         menu.record_target = rt;
-                                        std::fprintf(stderr, "[bank] record target -> %c\n", rt == 0 ? 'A' : 'B');
                                         break;
                                     }
-                                    case 9: {  // Gain toggle (TRS instrument / line)
+                                    case 3: {  // Gain toggle
                                         bool instr = !trs_instrument_gain.load();
                                         trs_instrument_gain.store(instr);
                                         mono_passthrough.store(instr, std::memory_order_relaxed);
@@ -1206,34 +1189,60 @@ int main(int argc, char** argv) {
                                         set_pga_gain_db(kMixerCard,
                                             instr ? kGainInstrument_dB : kGainLine_dB);
                                         menu.trs_instrument = instr;
-                                        {
-                                            std::lock_guard<std::mutex> lk(toast_mtx);
-                                            const char* label = instr ? "instrument" : "line";
-                                            std::strncpy(toast_disp.name,  "gain",  31);
-                                            std::strncpy(toast_disp.value, label,   31);
-                                            toast_disp.updated = std::chrono::steady_clock::now();
-                                        }
-                                        std::fprintf(stderr, "[gain] -> %s %.1fdB\n",
-                                            instr ? "instrument" : "line",
-                                            instr ? kGainInstrument_dB : kGainLine_dB);
+                                        { std::lock_guard<std::mutex> lk(toast_mtx);
+                                          const char* label = instr ? "instrument" : "line";
+                                          std::strncpy(toast_disp.name,  "gain",  31);
+                                          std::strncpy(toast_disp.value, label,   31);
+                                          toast_disp.updated = std::chrono::steady_clock::now(); }
                                         break;
                                     }
-                                    case 10: {  // Mode toggle
+                                    case 4: {  // Mode toggle
                                         int m = 1 - engine_mode.load();
                                         engine_mode.store(m);
-                                        std::fprintf(stderr, "[mode] -> %s\n",
-                                            m == 0 ? "analysis" : "exploration");
                                         break;
                                     }
-                                    case 11:  // Shutdown → confirm page
-                                        menu.page   = 9;
+                                    case 5:  // Parameters
+                                        menu.page = 12;
+                                        menu.cursor = 0;
+                                        menu.delay_ms = delay_time_ms.load();
+                                        break;
+                                    case 6:  // Shutdown
+                                        menu.page = 9; menu.cursor = 0; break;
+                                    case 7:  // Exit
+                                        menu.open = false; break;
+                                }
+                            } else if (menu.page == 10 || menu.page == 11) {
+                                bool is_a = (menu.page == 10);
+                                SliceStore& tgt      = is_a ? store_a : store_b;
+                                std::string& bname   = is_a ? bank_name_a : bank_name_b;
+                                std::string& cur_file= is_a ? cur_bank_a_file : cur_bank_b_file;
+                                switch (menu.cursor) {
+                                    case 0:  // Load
+                                        menu.page = is_a ? 1 : 2;
+                                        menu.cursor = 0;
+                                        menu.file_list = list_banks();
+                                        break;
+                                    case 1:  // Save as new
+                                        enter_name_page(is_a ? 5 : 6);
+                                        break;
+                                    case 2:  // Overwrite
+                                        if (!cur_file.empty()) {
+                                            if (save_bank(tgt, banks_dir() + cur_file, bname)) {
+                                                if (is_a) menu.bank_name_a = bname;
+                                                else      menu.bank_name_b = bname;
+                                                menu.has_file_a = !cur_bank_a_file.empty();
+                                                menu.has_file_b = !cur_bank_b_file.empty();
+                                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                            }
+                                        }
+                                        break;
+                                    case 3:  // Clear
+                                        menu.page = is_a ? 3 : 4;
                                         menu.cursor = 0;
                                         break;
-                                    case 12:  // Exit
-                                        menu.open = false;
-                                        std::fprintf(stderr, "[menu] closed\n");
-                                        break;
                                 }
+                            } else if (menu.page == 12) {
+                                // parameters page: short press = no-op (M to go back)
                             } else if (menu.page == 1 || menu.page == 2) {
                                 // load selected file
                                 if (!menu.file_list.empty()) {
@@ -1712,6 +1721,7 @@ int main(int argc, char** argv) {
 
             if (level == 0 && prev_level == 1) {
                 std::fprintf(stderr, "[mbtn] pressed\n");
+                {
                 std::lock_guard<std::mutex> lk(bank_menu_mtx);
                 if (bank_menu_disp.open) {
                     if (bank_menu_disp.page == 0) {
@@ -1733,6 +1743,7 @@ int main(int argc, char** argv) {
                         bank_menu_disp.cursor = 0;
                     }
                 }
+                } // end bank_menu_mtx scope
             }
 
             prev_level = level;

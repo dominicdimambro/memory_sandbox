@@ -33,12 +33,15 @@ struct ParamToast {
 // Protected by a dedicated mutex in main().
 struct BankMenuDisplay {
     bool     open          = false;
-    int      page          = 0;     // 0=Main,1=LoadA,2=LoadB,3=ConfirmClearA,4=ConfirmClearB,5=NameA,6=NameB,7=ConfirmDelA,8=ConfirmDelB
+    int      page          = 0;     // 0=Main,1=LoadA,2=LoadB,3=ConfirmClearA,4=ConfirmClearB,
+                                    // 5=NameA,6=NameB,7=ConfirmDelA,8=ConfirmDelB,9=ConfirmShutdown
+                                    // 10=BankA,11=BankB,12=Parameters
     int      cursor        = 0;
     char     name_buf[13]  = {};    // pages 5/6: name being entered
     char     delete_file[64] = {};  // pages 7/8: filename pending deletion
-    bool     has_file_a    = false; // cur_bank_a_file is non-empty (overwrite available)
+    bool     has_file_a    = false;
     bool     has_file_b    = false;
+    int      delay_ms      = 300;   // page 12: current delay time
     int      record_target   = 0;     // 0=A, 1=B
     bool     trs_instrument  = false; // reflects trs_instrument_gain atomic
     std::string bank_name_a;

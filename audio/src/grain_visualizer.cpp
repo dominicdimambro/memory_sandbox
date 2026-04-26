@@ -317,6 +317,15 @@ void GrainVisualizer::render_frame() {
     int n_pts = (int)points_.size();
     int grain_half = (n_pts < 80) ? 2 : (n_pts < 300) ? 1 : 0;
 
+    // crossfader alpha: full brightness from center to active side, fade only past center
+    float cf = crossfade_.load(std::memory_order_relaxed);
+    float scale_a = (cf < 0.5f) ? 1.0f : 2.0f * (1.0f - cf);
+    float scale_b = (cf > 0.5f) ? 1.0f : 2.0f * cf;
+    uint8_t alpha_a = (uint8_t)(50 + (int)(205 * scale_a));
+    uint8_t alpha_b = (uint8_t)(50 + (int)(205 * scale_b));
+
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+
     int cur_id   = current_id_.load(std::memory_order_relaxed);
     int cur_bank = current_bank_.load(std::memory_order_relaxed);
     for (auto& p : points_) {
@@ -326,10 +335,11 @@ void GrainVisualizer::render_frame() {
         if (!project(xr, yr, zr, sx, sy)) continue;
         if (sx < 0 || sx >= w_ || sy < 0 || sy >= h_) continue;
 
+        uint8_t alpha = p.from_b ? alpha_b : alpha_a;
         bool is_current = (p.id == cur_id && (p.from_b ? 1 : 0) == cur_bank);
 
         if (is_current) {
-            SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 255);
+            SDL_SetRenderDrawColor(renderer_, 255, 255, 255, alpha);
             SDL_Rect rect = {sx - 3, sy - 3, 7, 7};
             SDL_RenderDrawRect(renderer_, &rect);
         } else if (p.flash > 0.0f) {
@@ -340,13 +350,13 @@ void GrainVisualizer::render_frame() {
             SDL_SetRenderDrawColor(renderer_,
                 (uint8_t)(255 * t + br * (1.0f - t)),
                 (uint8_t)(255 * t + bg * (1.0f - t)),
-                (uint8_t)(255 * t + bb * (1.0f - t)), 255);
+                (uint8_t)(255 * t + bb * (1.0f - t)), alpha);
             int half = (int)(1.0f + 3.0f * t);
             SDL_Rect rect = {sx - half, sy - half, half * 2 + 1, half * 2 + 1};
             SDL_RenderFillRect(renderer_, &rect);
         } else {
-            if (p.from_b) SDL_SetRenderDrawColor(renderer_, 255, 150,   0, 255);
-            else          SDL_SetRenderDrawColor(renderer_,   0, 200, 220, 255);
+            if (p.from_b) SDL_SetRenderDrawColor(renderer_, 255, 150,   0, alpha);
+            else          SDL_SetRenderDrawColor(renderer_,   0, 200, 220, alpha);
             if (grain_half > 0) {
                 SDL_Rect rect = {sx - grain_half, sy - grain_half,
                                  grain_half * 2 + 1, grain_half * 2 + 1};
@@ -356,6 +366,8 @@ void GrainVisualizer::render_frame() {
             }
         }
     }
+
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
 
     if (mode == 1) theta_y_ += 0.004f;  // auto-rotate only in exploration mode
 
@@ -475,12 +487,13 @@ void GrainVisualizer::render_frame() {
 
             // count items for height
             int n_items = 0;
-            if (snap.page == 0) n_items = 13;
-            else if (snap.page == 1 || snap.page == 2)
-                n_items = (int)snap.file_list.size() + (snap.file_list.empty() ? 1 : 0);
+            if      (snap.page == 0)                   n_items = 8;
+            else if (snap.page == 1 || snap.page == 2) n_items = (int)snap.file_list.size() + (snap.file_list.empty() ? 1 : 0);
             else if (snap.page == 5 || snap.page == 6) n_items = 2;
             else if (snap.page == 7 || snap.page == 8) n_items = 3;
-            else if (snap.page == 9) n_items = 3;
+            else if (snap.page == 9)                   n_items = 3;
+            else if (snap.page == 10 || snap.page == 11) n_items = 4;
+            else if (snap.page == 12)                  n_items = 1;
             else n_items = 2;  // ConfirmClear
 
             int panel_h = kPad + kLineH + 4 + n_items * kLineH + kLineH + kPad;
@@ -500,47 +513,69 @@ void GrainVisualizer::render_frame() {
             int y = kPanelY;
 
             if (snap.page == 0) {
-                draw_text("BANK MENU", kPanelX, y, yellow); y += kLineH + 4;
+                draw_text("MENU", kPanelX, y, yellow); y += kLineH + 4;
 
                 std::string name_a = snap.bank_name_a.empty() ? "<empty>" : snap.bank_name_a;
                 std::string name_b = snap.bank_name_b.empty() ? "<empty>" : snap.bank_name_b;
-                if (snap.has_file_a) name_a += "  [↩ overwrite]";
-                if (snap.has_file_b) name_b += "  [↩ overwrite]";
                 std::string rec_toggle = std::string("Record -> ") +
                     (snap.record_target == 0 ? "B (currently A)" : "A (currently B)");
                 int cur_mode = engine_mode_.load(std::memory_order_relaxed);
                 std::string mode_item = std::string("Mode: ") +
-                    (cur_mode == 0 ? "Analysis  [→ Exploration]" : "Exploration  [→ Analysis]");
+                    (cur_mode == 0 ? "Analysis" : "Exploration");
                 std::string gain_item = snap.trs_instrument
-                    ? "Gain: INSTRUMENT  [→ Line]"
-                    : "Gain: LINE  [→ Instrument]";
-                const std::string items[13] = {
-                    "Slot A: " + name_a,
-                    "Slot B: " + name_b,
-                    "Load -> A",
-                    "Load -> B",
-                    "Save A as new",
-                    "Save B as new",
-                    "Clear A",
-                    "Clear B",
+                    ? "Gain: INSTRUMENT"
+                    : "Gain: LINE";
+                const std::string items[8] = {
+                    "Bank A: " + name_a,
+                    "Bank B: " + name_b,
                     rec_toggle,
                     gain_item,
                     mode_item,
+                    "Parameters",
                     "Shutdown",
                     "Exit"
                 };
-                for (int i = 0; i < 13; i++) {
+                for (int i = 0; i < 8; i++) {
                     bool selected = (i == snap.cursor);
                     if (selected) {
                         SDL_SetRenderDrawColor(renderer_, 60, 55, 0, 255);
                         SDL_Rect hl = {kPanelX - 4, y - 2, kPanelW + 8, kLineH};
                         SDL_RenderFillRect(renderer_, &hl);
                     }
-                    bool slot_item = (i == 0 && snap.has_file_a) || (i == 1 && snap.has_file_b);
-                    SDL_Color col = selected ? yellow : (i < 2 && !slot_item ? gray : white);
+                    SDL_Color col = selected ? yellow : white;
                     draw_text(items[i].c_str(), kPanelX, y, col);
                     y += kLineH;
                 }
+            } else if (snap.page == 10 || snap.page == 11) {
+                bool is_a = (snap.page == 10);
+                draw_text(is_a ? "BANK A" : "BANK B", kPanelX, y, yellow); y += kLineH + 4;
+                const char* sub_items[4] = {"Load", "Save as new",
+                    snap.has_file_a && is_a ? "Overwrite" :
+                    snap.has_file_b && !is_a ? "Overwrite" : "Overwrite",
+                    "Clear"};
+                bool overwrite_active = is_a ? snap.has_file_a : snap.has_file_b;
+                for (int i = 0; i < 4; i++) {
+                    bool selected = (i == snap.cursor);
+                    if (selected) {
+                        SDL_SetRenderDrawColor(renderer_, 60, 55, 0, 255);
+                        SDL_Rect hl = {kPanelX - 4, y - 2, kPanelW + 8, kLineH};
+                        SDL_RenderFillRect(renderer_, &hl);
+                    }
+                    SDL_Color col = selected ? yellow
+                                  : (i == 2 && !overwrite_active) ? gray : white;
+                    draw_text(sub_items[i], kPanelX, y, col);
+                    y += kLineH;
+                }
+            } else if (snap.page == 12) {
+                draw_text("PARAMETERS", kPanelX, y, yellow); y += kLineH + 4;
+                SDL_SetRenderDrawColor(renderer_, 60, 55, 0, 255);
+                SDL_Rect hl = {kPanelX - 4, y - 2, kPanelW + 8, kLineH};
+                SDL_RenderFillRect(renderer_, &hl);
+                char dbuf[48];
+                std::snprintf(dbuf, sizeof(dbuf), "Delay time:  %d ms", snap.delay_ms);
+                draw_text(dbuf, kPanelX, y, yellow); y += kLineH;
+                draw_text("enc4=adjust  M=back", kPanelX, y + 4, gray);
+                y += kLineH;
             } else if (snap.page == 1 || snap.page == 2) {
                 const char* title = (snap.page == 1) ? "LOAD INTO SLOT A" : "LOAD INTO SLOT B";
                 draw_text(title, kPanelX, y, yellow); y += kLineH + 4;
