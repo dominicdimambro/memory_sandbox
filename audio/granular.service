@@ -1,0 +1,22 @@
+[Unit]
+Description=Granular Synthesizer
+After=sound.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/dimadome7/memory_sandbox/audio
+ExecStartPre=/bin/sleep 3
+ExecStart=/home/dimadome7/memory_sandbox/audio/build/engine
+Restart=on-failure
+RestartSec=5
+Environment=HOME=/home/dimadome7
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# Allow real-time scheduling so audio threads don't get preempted
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+LimitNICE=-20
+
+[Install]
+WantedBy=multi-user.target

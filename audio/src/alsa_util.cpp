@@ -111,7 +111,11 @@ bool set_pga_gain_db(const char* card, float db) {
 
 void recover_if_xrun(snd_pcm_t* pcm, int err, const char* tag) {
     if (err == -EPIPE) {
-        std::fprintf(stderr, "[%s] XRUN, preparing device...\n", tag);
+        // timestamp the xrun so we can see the rhythm
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        std::fprintf(stderr, "[%s] XRUN at %.3fs — preparing\n",
+                     tag, ts.tv_sec + ts.tv_nsec * 1e-9);
         snd_pcm_prepare(pcm);
     } else if (err == -ESTRPIPE) {
         std::fprintf(stderr, "[%s] ESTRPIPE, trying resume...\n", tag);

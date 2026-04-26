@@ -193,6 +193,59 @@ struct SliceStore {
         return true;
     }
 
+    // Like closest_k_id but query is already in projected space (matches snapshot() coords).
+    // out_radius = distance to the k-th nearest grain — used by visualizer to draw the sphere.
+    bool closest_k_id_xyz(float qx, float qy, float qz,
+                          int k, uint32_t& rng, int& out_id, float& out_radius) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (slices.empty()) return false;
+        if (k < 1) k = 1;
+        static constexpr int kMaxK = 10;
+        if (k > kMaxK) k = kMaxK;
+
+        auto norm_tonal = [](float t) { return t * 0.5f; };
+        auto norm_rolloff = [](float r) {
+            float v = (std::log(r < 47.f ? 47.f : r) - 3.850f) / (9.393f - 3.850f) - 0.5f;
+            return v < -0.5f ? -0.5f : v > 0.5f ? 0.5f : v;
+        };
+        auto norm_rms = [](float r) {
+            float v = std::sqrt(r / 0.12f);
+            return (v > 1.f ? 1.f : v) - 0.5f;
+        };
+
+        int   best_ids[kMaxK]  = {};
+        float best_dist[kMaxK] = {};
+        int   found = 0;
+
+        for (auto& [id, slice] : slices) {
+            const auto& f = slice.features;
+            float dx = norm_tonal(f.tonal_alignment_score) - qx;
+            float dy = norm_rolloff(f.rolloff_freq) - qy;
+            float dz = norm_rms(f.rms) - qz;
+            float d2 = dx*dx + dy*dy + dz*dz;
+
+            if (found < k) {
+                best_ids[found] = id;
+                best_dist[found++] = d2;
+            } else {
+                int wi = 0;
+                for (int i = 1; i < k; i++)
+                    if (best_dist[i] > best_dist[wi]) wi = i;
+                if (d2 < best_dist[wi]) {
+                    best_ids[wi] = id;
+                    best_dist[wi] = d2;
+                }
+            }
+        }
+
+        if (found == 0) return false;
+        out_id = best_ids[rng % (uint32_t)found];
+        float max_d2 = 0.0f;
+        for (int i = 0; i < found; i++) if (best_dist[i] > max_d2) max_d2 = best_dist[i];
+        out_radius = std::sqrt(max_d2);
+        return true;
+    }
+
 
     const int16_t* ptr(uint64_t corpusIndex) const {
         return corpus.data() + corpusIndex;

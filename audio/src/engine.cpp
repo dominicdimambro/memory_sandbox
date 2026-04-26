@@ -176,8 +176,8 @@ static void load_config(std::string& a_file, std::string& b_file, int& rec) {
 // ---- main ----
 
 int main(int argc, char** argv) {
-    const char* cap_dev = (argc > 1) ? argv[1] : "plughw:2,0";
-    const char* pb_dev  = (argc > 2) ? argv[2] : "plughw:2,0";
+    const char* cap_dev = (argc > 1) ? argv[1] : "hw:2,0";
+    const char* pb_dev  = (argc > 2) ? argv[2] : "hw:2,0";
 
     const unsigned int rate = 48000;
     const unsigned int channels = 2;
@@ -237,7 +237,12 @@ int main(int argc, char** argv) {
     };
 
     analyzers.push_back(std::make_unique<RMSAnalyzer>());
-    analyzers.push_back(std::make_unique<GainNormalizerAnalyzer>());
+    {
+        auto gn = std::make_unique<GainNormalizerAnalyzer>();
+        gn->target_rms = 0.07f;
+        gn->max_gain   = 1.5f;  // cap at 1.5× to keep peaks below limiter
+        analyzers.push_back(std::move(gn));
+    }
     analyzers.push_back(std::make_unique<F0Analyzer>());
     analyzers.push_back(std::make_unique<SpectralRolloffAnalyzer>());
     analyzers.push_back(std::make_unique<SpectralFlatnessAnalyzer>());
@@ -248,23 +253,38 @@ int main(int argc, char** argv) {
 
     SliceStore store_a;
     SliceStore store_b;
+    // pre-reserve to prevent allocations under mutex during recording
+    store_a.corpus.reserve(48000 * 2 * 180);   // ~3 min stereo
+    store_b.corpus.reserve(48000 * 2 * 180);
+    store_a.slices.reserve(4000);               // prevent unordered_map rehash
+    store_b.slices.reserve(4000);
 
     std::atomic<uint64_t> rb_epoch{0};
     std::vector<int16_t> one_sec_window(rb_capacity_samples);
 
-    std::atomic<float> slicer_sensitivity{1.0f};
+    std::atomic<float> slicer_sensitivity{3.0f};
+    std::atomic<float> activity_halflife_ms{50.0f};  // ms; 1e9 = hold forever
+
+    std::atomic<int>   engine_mode{0};        // 0=analysis, 1=exploration
+    std::atomic<float> explore_x{0.0f};       // centroid in projected space [-0.5, 0.5]
+    std::atomic<float> explore_y{0.0f};
+    std::atomic<float> explore_z{0.0f};
+    std::atomic<float> search_radius{0.0f};   // dist to k-th nearest grain; for viz sphere
+    std::atomic<float> view_theta_y{0.4f};     // analysis-mode view rotation (encoder-controlled)
+    std::atomic<float> view_theta_x{0.3f};
+    std::atomic<float> view_zoom{2.0f};       // scale multiplier [0.3, 3.0]
 
     std::atomic<int>  tonal_root_idx{0};
     std::atomic<bool> tonal_minor{false};
 
-    std::atomic<int> grain_interval_ms{1000};
+    std::atomic<int> grain_interval_ms{200};
     std::atomic<int> grain_length_ms{200};
     std::atomic<bool> explicit_mode{false};
     std::atomic<int> current_grain_id{-1};
     std::atomic<int> current_bank{0};       // 0=store_a, 1=store_b (for viz highlight)
     std::atomic<float> env_pos{1.0f};
     std::atomic<bool> passthrough_enabled{false};
-    std::atomic<float> dry_wet{1.0f};
+    std::atomic<float> dry_wet{0.0f};
     std::atomic<bool> mono_passthrough{false};
     std::atomic<bool> hpf_enabled{false};
 
@@ -272,9 +292,7 @@ int main(int argc, char** argv) {
     std::atomic<float> crossfade_pos{0.0f};  // 0=all A, 1=all B
     std::atomic<int>   record_target{0};     // 0=store_a, 1=store_b
     std::atomic<int>   new_slice_signal{0};
-    std::atomic<int>   gain_change_pending{0};
-    std::atomic<bool>  gain_confirm{false};
-    std::atomic<bool>  gain_cancel{false};
+    std::atomic<bool>  trs_instrument_gain{false};  // true=instrument 40dB, false=line 0dB
 
     std::atomic<int>   grain_k{5};
     std::atomic<float> live_tonal{0.f};
@@ -298,6 +316,7 @@ int main(int argc, char** argv) {
     }
 
     // auto-load last banks from config
+    std::string cur_bank_a_file, cur_bank_b_file;
     {
         std::string a_file, b_file;
         int rec_tgt = 0;
@@ -305,14 +324,16 @@ int main(int argc, char** argv) {
         if (!a_file.empty()) {
             std::string loaded_name;
             if (load_bank(store_a, banks_dir() + a_file, loaded_name)) {
-                bank_name_a = loaded_name;
+                bank_name_a     = loaded_name;
+                cur_bank_a_file = a_file;
                 std::fprintf(stderr, "[bank] loaded slot A: %s (%s)\n", a_file.c_str(), loaded_name.c_str());
             }
         }
         if (!b_file.empty()) {
             std::string loaded_name;
             if (load_bank(store_b, banks_dir() + b_file, loaded_name)) {
-                bank_name_b = loaded_name;
+                bank_name_b     = loaded_name;
+                cur_bank_b_file = b_file;
                 std::fprintf(stderr, "[bank] loaded slot B: %s (%s)\n", b_file.c_str(), loaded_name.c_str());
             }
         }
@@ -327,10 +348,13 @@ int main(int argc, char** argv) {
 
     GrainVisualizer viz(store_a, store_b, g_run,
                         current_grain_id, current_bank,
-                        gain_change_pending,
                         crossfade_pos,
                         bank_menu_mtx, bank_menu_disp,
-                        toast_mtx, toast_disp);
+                        toast_mtx, toast_disp,
+                        engine_mode,
+                        explore_x, explore_y, explore_z,
+                        search_radius,
+                        view_theta_y, view_theta_x, view_zoom);
 
     const size_t pt_rb_capacity = samples_per_period * 8;
     RingBuffer<int16_t> pt_rb(pt_rb_capacity);
@@ -604,9 +628,19 @@ int main(int argc, char** argv) {
         aps_L[0].init(480); aps_L[1].init(161);
         aps_R[0].init(500); aps_R[1].init(171);
 
-        float master_env = 0.0f;
+        float master_env        = 0.0f;
+        float activity_level    = 0.0f;  // stays 0 until live audio is detected
+        float voice_scale_smooth = 1.0f;  // smoothed 1/sqrt(n_active) to avoid per-period amplitude jumps
+        // frozen query features: only update when signal is present so sustained
+        // retriggering keeps targeting the last audible sound, not silence
+        float frozen_tonal   = 0.0f;
+        float frozen_rolloff = 1000.0f;
+        float frozen_rms     = 0.05f;
         static constexpr float kMasterAttack  = 0.10f;
         static constexpr float kMasterRelease = 0.008f;
+        static constexpr float kMasterGain    = 0.7f;              // ~-3dB overall level
+        static constexpr float kClipKnee      = 26000.0f;          // transparent below ~-2dBFS
+        static constexpr float kClipHeadroom  = 32767.0f - kClipKnee;
 
         auto next_switch = std::chrono::steady_clock::now();
 
@@ -614,7 +648,6 @@ int main(int argc, char** argv) {
             size_t got = 0;
 
             bool playing = play_enabled.load(std::memory_order_relaxed);
-            bool rec     = record_enabled.load(std::memory_order_relaxed);
             bool expl    = explicit_mode.load(std::memory_order_relaxed);
             int interval = grain_interval_ms.load(std::memory_order_relaxed);
             int glen_ms  = grain_length_ms.load(std::memory_order_relaxed);
@@ -623,20 +656,25 @@ int main(int argc, char** argv) {
             if (!playing) {
                 got = 0;
             }
-            else if (rec) {
-                if (rb_mtx.try_lock()) {
-                    const size_t delay = samples_per_period * 2;
-                    got = rb.copy_latest(out.data(), samples_per_period, delay);
-                    rb_mtx.unlock();
-                } else {
-                    got = 0;
-                }
-            }
             else {
+                float dw_check  = dry_wet.load(std::memory_order_relaxed);
+                bool  grains_on = (dw_check >= 0.01f);  // skip grain engine entirely when fully dry
+
                 auto now = std::chrono::steady_clock::now();
-                bool live_active = !live_valid.load(std::memory_order_acquire)
-                                   || live_rms.load(std::memory_order_relaxed) >= 0.01f;
-                if (now >= next_switch && live_active) {
+                bool  lv_valid  = live_valid.load(std::memory_order_acquire);
+                float lv_rms    = live_rms.load(std::memory_order_relaxed);
+                if (lv_valid && lv_rms >= 0.01f) {
+                    activity_level = 1.0f;
+                } else {
+                    float hl = activity_halflife_ms.load(std::memory_order_relaxed);
+                    if (hl < 1e8f) {
+                        float period_ms = (float)samples_per_period / (float)rate * 1000.0f;
+                        activity_level *= powf(0.5f, period_ms / hl);
+                    }
+                    // hl >= 1e8: hold — don't decay
+                }
+                bool live_active = (activity_level >= 0.01f);
+                if (grains_on && now >= next_switch && live_active) {
                     rng = xorshift32(rng);
 
                     // probabilistic crossfade: roll dice, pick from one bank, fallback to other
@@ -654,10 +692,29 @@ int main(int argc, char** argv) {
                     float lrm = live_rms.load(std::memory_order_relaxed);
                     int   gk  = grain_k.load(std::memory_order_relaxed);
 
-                    if (live_valid.load(std::memory_order_acquire)) {
-                        if (pick_store->closest_k_id(lt, lr, lrm, gk, rng, new_id)) {
+                    // freeze query features while signal is present; hold last value during silence
+                    if (lv_valid && lv_rms >= 0.01f) {
+                        frozen_tonal   = lt;
+                        frozen_rolloff = lr;
+                        frozen_rms     = lrm;
+                    }
+
+                    float cur_radius = 0.0f;
+                    if (engine_mode.load(std::memory_order_relaxed) == 1) {
+                        // exploration: query by encoder XYZ centroid
+                        float ex = explore_x.load(std::memory_order_relaxed);
+                        float ey = explore_y.load(std::memory_order_relaxed);
+                        float ez = explore_z.load(std::memory_order_relaxed);
+                        if (pick_store->closest_k_id_xyz(ex, ey, ez, gk, rng, new_id, cur_radius)) {
                             found_id = true; chosen_store = pick_store;
-                        } else if (fallback_store->closest_k_id(lt, lr, lrm, gk, rng, new_id)) {
+                        } else if (fallback_store->closest_k_id_xyz(ex, ey, ez, gk, rng, new_id, cur_radius)) {
+                            found_id = true; chosen_store = fallback_store;
+                        }
+                    } else if (lv_valid) {
+                        // analysis: query by frozen features (hold last audible sound during silence)
+                        if (pick_store->closest_k_id(frozen_tonal, frozen_rolloff, frozen_rms, gk, rng, new_id)) {
+                            found_id = true; chosen_store = pick_store;
+                        } else if (fallback_store->closest_k_id(frozen_tonal, frozen_rolloff, frozen_rms, gk, rng, new_id)) {
                             found_id = true; chosen_store = fallback_store;
                         }
                     }
@@ -668,6 +725,8 @@ int main(int argc, char** argv) {
                             found_id = true; chosen_store = fallback_store;
                         }
                     }
+
+                    search_radius.store(cur_radius, std::memory_order_relaxed);
 
                     if (found_id && chosen_store) {
                         Slice tmp;
@@ -712,7 +771,13 @@ int main(int argc, char** argv) {
                 }
 
                 std::fill(mix.begin(), mix.end(), 0);
-                {
+                if (grains_on) {
+                    int n_active = 0;
+                    for (auto& v : voices) if (v.active) n_active++;
+                    float target_scale = (n_active > 1) ? 1.0f / sqrtf((float)n_active) : 1.0f;
+                    voice_scale_smooth += (target_scale - voice_scale_smooth) * 0.25f;
+                    float voice_scale = voice_scale_smooth;
+
                     // lock both stores for the entire mixing loop
                     std::lock_guard<std::mutex> la(store_a.mtx);
                     std::lock_guard<std::mutex> lb(store_b.mtx);
@@ -734,15 +799,15 @@ int main(int argc, char** argv) {
                                     env = 1.0f;
                                 }
                                 uint32_t src = (mono_grain && (i % 2 == 1)) ? (v.pos + i - 1) : (v.pos + i);
-                                mix[i] += (int32_t)((float)base[src] * env * v.slice.features.gain);
+                                mix[i] += (int32_t)((float)base[src] * env * v.slice.features.gain * voice_scale);
                             }
                             v.pos += take;
                         }
                         if (v.pos >= v.play_end) v.active = false;
                     }
-                }
+                }  // end grains_on mixing block
 
-                float env_target = live_active ? 1.0f : 0.0f;
+                float env_target = (grains_on && live_active) ? 1.0f : 0.0f;
                 float env_step   = live_active ? kMasterAttack : kMasterRelease;
                 if (master_env < env_target) {
                     master_env = std::min(master_env + env_step, 1.0f);
@@ -751,8 +816,18 @@ int main(int argc, char** argv) {
                 }
 
                 for (size_t i = 0; i < samples_per_period; i++) {
-                    int32_t s = (int32_t)(mix[i] * master_env);
-                    out[i] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
+                    float s     = (float)mix[i] * master_env * kMasterGain;
+                    float abs_s = s < 0.0f ? -s : s;
+                    float limited;
+                    if (abs_s <= kClipKnee) {
+                        limited = s;   // transparent below knee
+                    } else {
+                        float excess = abs_s - kClipKnee;
+                        float sat    = kClipKnee + kClipHeadroom * tanhf(excess / kClipHeadroom);
+                        limited = s < 0.0f ? -sat : sat;
+                    }
+                    int32_t ls = (int32_t)limited;
+                    out[i] = (int16_t)(ls > 32767 ? 32767 : ls < -32768 ? -32768 : ls);
                 }
                 got = samples_per_period;
             }
@@ -826,6 +901,13 @@ int main(int argc, char** argv) {
         }
     });
 
+    // ---- input gain presets (used by encoder menu and switch thread) ----
+    static constexpr const char* kMixerCard       = "hw:2";
+    static constexpr float kGainLine_dB        =  0.0f;
+    static constexpr float kGainInstrument_dB  = 40.0f;
+    static constexpr float kGainDualJack_dB    =  0.0f;
+    static constexpr float kGainMic_dB         = 30.0f;
+
     // ---- encoder thread (MCP23017 via I2C) ----
     // enc1: A=GPA7 B=GPA6 btn=GPB0
     // enc2: A=GPA5 B=GPA4 btn=GPB1
@@ -877,8 +959,23 @@ int main(int argc, char** argv) {
 
         // local menu state (encoder thread is the sole writer)
         BankMenuDisplay menu;
-        std::string cur_bank_a_file;  // tracks which file slot A is saved as
-        std::string cur_bank_b_file;
+
+        // name-entry state (pages 5=SaveA, 6=SaveB)
+        static const char kNameChars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        static constexpr int kNameCharsLen = 39;
+        static constexpr int kNameMaxLen   = 12;
+        int name_char_idx[kNameMaxLen] = {};
+        auto apply_name = [&]() {
+            for (int i = 0; i < kNameMaxLen; i++)
+                menu.name_buf[i] = kNameChars[name_char_idx[i]];
+            menu.name_buf[kNameMaxLen] = '\0';
+        };
+        auto enter_name_page = [&](int page) {
+            std::memset(name_char_idx, 0, sizeof(name_char_idx));
+            menu.cursor = 0;
+            menu.page   = page;
+            apply_name();
+        };
 
         while (g_run.load(std::memory_order_relaxed)) {
             // sync local menu state with any external changes (e.g. mbtn back press)
@@ -889,6 +986,7 @@ int main(int argc, char** argv) {
                 } else if (menu.open && bank_menu_disp.page != menu.page) {
                     menu.page   = bank_menu_disp.page;
                     menu.cursor = bank_menu_disp.cursor;
+                    std::memcpy(menu.delete_file, bank_menu_disp.delete_file, sizeof(menu.delete_file));
                 }
             }
 
@@ -911,33 +1009,101 @@ int main(int argc, char** argv) {
             // enc4 rotation: navigate menu when open
             if (deltas[3] != 0) {
                 if (menu.open) {
-                    int max_items = 0;
-                    if (menu.page == 0) max_items = 10;
-                    else if (menu.page == 1 || menu.page == 2)
-                        max_items = (int)menu.file_list.size();
-                    if (max_items > 0) {
-                        menu.cursor = (menu.cursor + deltas[3] + max_items) % max_items;
+                    if (menu.page == 5 || menu.page == 6) {
+                        // name entry: cycle character at cursor
+                        int pos = menu.cursor;
+                        name_char_idx[pos] = ((name_char_idx[pos] + deltas[3]) % kNameCharsLen
+                                              + kNameCharsLen) % kNameCharsLen;
+                        apply_name();
                         std::lock_guard<std::mutex> lk(bank_menu_mtx);
-                        bank_menu_disp.cursor = menu.cursor;
+                        std::memcpy(bank_menu_disp.name_buf, menu.name_buf, sizeof(menu.name_buf));
+                        bank_menu_disp.cursor = pos;
+                    } else {
+                        int max_items = 0;
+                        if (menu.page == 0) max_items = 13;
+                        else if (menu.page == 1 || menu.page == 2)
+                            max_items = (int)menu.file_list.size();
+                        if (max_items > 0) {
+                            menu.cursor = (menu.cursor + deltas[3] + max_items) % max_items;
+                            std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                            bank_menu_disp.cursor = menu.cursor;
+                        }
                     }
                 } else {
-                    std::fprintf(stderr, "[encoder4] counter=%d\n", counters[3]);
+                    // menu closed: cycle tonic root
+                    static const char* kKeyNames[12] = {"A","Bb","B","C","C#","D","Eb","E","F","F#","G","Ab"};
+                    int idx = (deltas[3] < 0)
+                        ? (tonal_root_idx.load() + 11) % 12
+                        : (tonal_root_idx.load() +  1) % 12;
+                    tonal_root_idx.store(idx);
+                    ScaleType sc = tonal_minor.load() ? ScaleType::Minor : ScaleType::Major;
+                    auto update_tonal_rot = [&](SliceStore& st) {
+                        std::lock_guard<std::mutex> lk(st.mtx);
+                        for (auto& [id, slice] : st.slices)
+                            slice.features.tonal_alignment_score =
+                                TonalAlignmentAnalyzer::tonal_score_from_chroma(
+                                    slice.features.chroma_energy, idx, sc);
+                    };
+                    update_tonal_rot(store_a);
+                    update_tonal_rot(store_b);
+                    { std::lock_guard<std::mutex> lk(toast_mtx);
+                      std::snprintf(toast_disp.name,  sizeof(toast_disp.name),  "Key");
+                      std::snprintf(toast_disp.value, sizeof(toast_disp.value), "%s %s",
+                          kKeyNames[idx], tonal_minor.load() ? "minor" : "major");
+                      toast_disp.updated = std::chrono::steady_clock::now(); }
                 }
             }
-            // enc1-3 deltas: just print
-            for (int i = 0; i < 3; i++) {
-                if (deltas[i] != 0)
-                    std::fprintf(stderr, "[encoder%d] counter=%d\n", i + 1, counters[i]);
+            // enc1-3 rotation: mode-dependent
+            {
+                int mode = engine_mode.load(std::memory_order_relaxed);
+                auto clamp = [](float v, float lo, float hi) {
+                    return v < lo ? lo : v > hi ? hi : v;
+                };
+                for (int i = 0; i < 3; i++) {
+                    if (deltas[i] == 0) continue;
+                    if (mode == 0) {
+                        // analysis: enc1=theta_y enc2=theta_x enc3=zoom
+                        if (i == 0) {
+                            view_theta_y.store(view_theta_y.load() + deltas[i] * 0.05f,
+                                               std::memory_order_relaxed);
+                        } else if (i == 1) {
+                            view_theta_x.store(clamp(view_theta_x.load() + deltas[i] * 0.02f,
+                                                     -1.2f, 1.2f), std::memory_order_relaxed);
+                        } else {
+                            view_zoom.store(clamp(view_zoom.load() + deltas[i] * 0.05f,
+                                                  0.3f, 3.0f), std::memory_order_relaxed);
+                        }
+                    } else {
+                        // exploration: enc1=X enc2=Y enc3=Z centroid position
+                        if (i == 0)
+                            explore_x.store(clamp(explore_x.load() + deltas[i] * 0.01f,
+                                                  -0.5f, 0.5f), std::memory_order_relaxed);
+                        else if (i == 1)
+                            explore_y.store(clamp(explore_y.load() + deltas[i] * 0.01f,
+                                                  -0.5f, 0.5f), std::memory_order_relaxed);
+                        else
+                            explore_z.store(clamp(explore_z.load() + deltas[i] * 0.01f,
+                                                  -0.5f, 0.5f), std::memory_order_relaxed);
+                    }
+                }
             }
 
-            // enc1-3 buttons: print only
+            // enc1-3 buttons: reset view (analysis) or individual axis (exploration)
             for (int i = 0; i < 3; i++) {
                 uint8_t mask = 1u << kBtnBit[i];
-                uint8_t cur  = port_b  & mask;
+                uint8_t cur  = port_b & mask;
                 uint8_t prev = prev_btn_raw & mask;
-                if (cur != prev) {
-                    bool pressed = (cur == 0);
-                    std::fprintf(stderr, "[encoder%d] button=%s\n", i + 1, pressed ? "pressed" : "released");
+                if (cur != prev && cur == 0) {  // falling edge = press (active low)
+                    int mode = engine_mode.load(std::memory_order_relaxed);
+                    if (mode == 0) {
+                        if      (i == 0) { view_theta_y.store(0.4f, std::memory_order_relaxed); std::fprintf(stderr, "[encoder1] theta_y reset\n"); }
+                        else if (i == 1) { view_theta_x.store(0.3f, std::memory_order_relaxed); std::fprintf(stderr, "[encoder2] theta_x reset\n"); }
+                        else             { view_zoom.store(2.0f,    std::memory_order_relaxed); std::fprintf(stderr, "[encoder3] zoom reset\n"); }
+                    } else {
+                        if      (i == 0) { explore_x.store(0.0f, std::memory_order_relaxed); std::fprintf(stderr, "[encoder1] x reset\n"); }
+                        else if (i == 1) { explore_y.store(0.0f, std::memory_order_relaxed); std::fprintf(stderr, "[encoder2] y reset\n"); }
+                        else             { explore_z.store(0.0f, std::memory_order_relaxed); std::fprintf(stderr, "[encoder3] z reset\n"); }
+                    }
                 }
             }
 
@@ -963,7 +1129,10 @@ int main(int argc, char** argv) {
                             menu.cursor = 0;
                             menu.bank_name_a    = bank_name_a;
                             menu.bank_name_b    = bank_name_b;
+                            menu.has_file_a     = !cur_bank_a_file.empty();
+                            menu.has_file_b     = !cur_bank_b_file.empty();
                             menu.record_target  = record_target.load();
+                            menu.trs_instrument = trs_instrument_gain.load();
                             menu.file_list.clear();
                             std::fprintf(stderr, "[menu] opened\n");
                         } else {
@@ -977,7 +1146,26 @@ int main(int argc, char** argv) {
                             // advance / select current item
                             if (menu.page == 0) {
                                 switch (menu.cursor) {
-                                    case 0: case 1: break;  // label items — no-op
+                                    case 0: {  // Slot A — overwrite if file loaded
+                                        if (!cur_bank_a_file.empty()) {
+                                            if (save_bank(store_a, banks_dir() + cur_bank_a_file, bank_name_a)) {
+                                                menu.bank_name_a = bank_name_a;
+                                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                                std::fprintf(stderr, "[bank] overwrite A: %s\n", cur_bank_a_file.c_str());
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case 1: {  // Slot B — overwrite if file loaded
+                                        if (!cur_bank_b_file.empty()) {
+                                            if (save_bank(store_b, banks_dir() + cur_bank_b_file, bank_name_b)) {
+                                                menu.bank_name_b = bank_name_b;
+                                                save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                                std::fprintf(stderr, "[bank] overwrite B: %s\n", cur_bank_b_file.c_str());
+                                            }
+                                        }
+                                        break;
+                                    }
                                     case 2:  // Load -> A
                                         menu.page = 1;
                                         menu.cursor = 0;
@@ -988,34 +1176,12 @@ int main(int argc, char** argv) {
                                         menu.cursor = 0;
                                         menu.file_list = list_banks();
                                         break;
-                                    case 4: {  // Save A as new
-                                        std::string fname = timestamp_name();
-                                        std::string path  = banks_dir() + fname;
-                                        std::string disp  = fname.substr(0, fname.size() - 5);
-                                        if (save_bank(store_a, path, disp)) {
-                                            bank_name_a = disp;
-                                            cur_bank_a_file = fname;
-                                            menu.bank_name_a = disp;
-                                            save_config(cur_bank_a_file, cur_bank_b_file,
-                                                        record_target.load());
-                                            std::fprintf(stderr, "[bank] saved A: %s\n", fname.c_str());
-                                        }
+                                    case 4:  // Save A as new → name entry
+                                        enter_name_page(5);
                                         break;
-                                    }
-                                    case 5: {  // Save B as new
-                                        std::string fname = timestamp_name();
-                                        std::string path  = banks_dir() + fname;
-                                        std::string disp  = fname.substr(0, fname.size() - 5);
-                                        if (save_bank(store_b, path, disp)) {
-                                            bank_name_b = disp;
-                                            cur_bank_b_file = fname;
-                                            menu.bank_name_b = disp;
-                                            save_config(cur_bank_a_file, cur_bank_b_file,
-                                                        record_target.load());
-                                            std::fprintf(stderr, "[bank] saved B: %s\n", fname.c_str());
-                                        }
+                                    case 5:  // Save B as new → name entry
+                                        enter_name_page(6);
                                         break;
-                                    }
                                     case 6:  // Clear A
                                         menu.page   = 3;
                                         menu.cursor = 0;
@@ -1032,7 +1198,38 @@ int main(int argc, char** argv) {
                                         std::fprintf(stderr, "[bank] record target -> %c\n", rt == 0 ? 'A' : 'B');
                                         break;
                                     }
-                                    case 9:  // Exit
+                                    case 9: {  // Gain toggle (TRS instrument / line)
+                                        bool instr = !trs_instrument_gain.load();
+                                        trs_instrument_gain.store(instr);
+                                        mono_passthrough.store(instr, std::memory_order_relaxed);
+                                        hpf_enabled.store(instr,      std::memory_order_relaxed);
+                                        set_pga_gain_db(kMixerCard,
+                                            instr ? kGainInstrument_dB : kGainLine_dB);
+                                        menu.trs_instrument = instr;
+                                        {
+                                            std::lock_guard<std::mutex> lk(toast_mtx);
+                                            const char* label = instr ? "instrument" : "line";
+                                            std::strncpy(toast_disp.name,  "gain",  31);
+                                            std::strncpy(toast_disp.value, label,   31);
+                                            toast_disp.updated = std::chrono::steady_clock::now();
+                                        }
+                                        std::fprintf(stderr, "[gain] -> %s %.1fdB\n",
+                                            instr ? "instrument" : "line",
+                                            instr ? kGainInstrument_dB : kGainLine_dB);
+                                        break;
+                                    }
+                                    case 10: {  // Mode toggle
+                                        int m = 1 - engine_mode.load();
+                                        engine_mode.store(m);
+                                        std::fprintf(stderr, "[mode] -> %s\n",
+                                            m == 0 ? "analysis" : "exploration");
+                                        break;
+                                    }
+                                    case 11:  // Shutdown → confirm page
+                                        menu.page   = 9;
+                                        menu.cursor = 0;
+                                        break;
+                                    case 12:  // Exit
                                         menu.open = false;
                                         std::fprintf(stderr, "[menu] closed\n");
                                         break;
@@ -1092,12 +1289,76 @@ int main(int argc, char** argv) {
                                 std::fprintf(stderr, "[bank] cleared slot B\n");
                                 menu.page   = 0;
                                 menu.cursor = 0;
+                            } else if (menu.page == 9) {
+                                // confirm shutdown
+                                std::fprintf(stderr, "[menu] shutdown confirmed\n");
+                                std::lock_guard<std::mutex> lk(bank_menu_mtx);
+                                bank_menu_disp = menu;
+                                std::system("poweroff");
+                            } else if (menu.page == 7 || menu.page == 8) {
+                                // confirm delete
+                                if (menu.delete_file[0]) {
+                                    std::error_code ec;
+                                    std::filesystem::remove(banks_dir() + menu.delete_file, ec);
+                                    std::fprintf(stderr, "[bank] deleted: %s\n", menu.delete_file);
+                                    menu.delete_file[0] = '\0';
+                                }
+                                menu.page      = (menu.page == 7) ? 1 : 2;
+                                menu.cursor    = 0;
+                                menu.file_list = list_banks();
+                            } else if (menu.page == 5 || menu.page == 6) {
+                                // name entry: advance cursor or confirm save
+                                if (menu.cursor < kNameMaxLen - 1) {
+                                    menu.cursor++;
+                                } else {
+                                    // last position: confirm save
+                                    std::string raw(menu.name_buf, kNameMaxLen);
+                                    while (!raw.empty() && raw.back() == ' ') raw.pop_back();
+                                    if (raw.empty()) raw = "bank";
+                                    auto t = std::time(nullptr);
+                                    struct tm tmi; localtime_r(&t, &tmi);
+                                    char ts[32]; std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmi);
+                                    std::string fname = raw + "_" + ts + ".gran";
+                                    bool saving_a = (menu.page == 5);
+                                    SliceStore& tgt = saving_a ? store_a : store_b;
+                                    if (save_bank(tgt, banks_dir() + fname, raw)) {
+                                        if (saving_a) {
+                                            bank_name_a = raw; cur_bank_a_file = fname;
+                                            menu.bank_name_a = raw;
+                                        } else {
+                                            bank_name_b = raw; cur_bank_b_file = fname;
+                                            menu.bank_name_b = raw;
+                                        }
+                                        save_config(cur_bank_a_file, cur_bank_b_file, record_target.load());
+                                        std::fprintf(stderr, "[bank] saved %c: %s\n", saving_a?'A':'B', fname.c_str());
+                                    }
+                                    menu.page   = 0;
+                                    menu.cursor = 0;
+                                }
                             }
                             std::lock_guard<std::mutex> lk(bank_menu_mtx);
                             bank_menu_disp = menu;
                         } else {
-                            // normal short-press: gain confirm
-                            gain_confirm.store(true, std::memory_order_relaxed);
+                            // enc4 short-press, menu closed: toggle major/minor
+                            static const char* kKeyNames[12] = {"A","Bb","B","C","C#","D","Eb","E","F","F#","G","Ab"};
+                            bool minor = !tonal_minor.load();
+                            tonal_minor.store(minor);
+                            int idx = tonal_root_idx.load();
+                            ScaleType sc = minor ? ScaleType::Minor : ScaleType::Major;
+                            auto update_tonal_btn = [&](SliceStore& st) {
+                                std::lock_guard<std::mutex> lk(st.mtx);
+                                for (auto& [id, slice] : st.slices)
+                                    slice.features.tonal_alignment_score =
+                                        TonalAlignmentAnalyzer::tonal_score_from_chroma(
+                                            slice.features.chroma_energy, idx, sc);
+                            };
+                            update_tonal_btn(store_a);
+                            update_tonal_btn(store_b);
+                            { std::lock_guard<std::mutex> lk(toast_mtx);
+                              std::snprintf(toast_disp.name,  sizeof(toast_disp.name),  "Key");
+                              std::snprintf(toast_disp.value, sizeof(toast_disp.value), "%s %s",
+                                  kKeyNames[idx], minor ? "minor" : "major");
+                              toast_disp.updated = std::chrono::steady_clock::now(); }
                         }
                     }
                 }
@@ -1199,17 +1460,44 @@ int main(int argc, char** argv) {
                 if (diff >= kThreshold) {
                     prev[ch] = val;
                     if (ch == 0) {
-                        float s = 0.5f + (val / 1023.0f) * 9.5f;
+                        float norm = val / 1023.0f;
+                        float s    = 0.5f + norm * 9.5f;
                         slicer_sensitivity.store(s, std::memory_order_relaxed);
-                        char buf[32]; std::snprintf(buf, sizeof(buf), "%.1f", s);
-                        update_toast("sensitivity", buf);
-                        std::fprintf(stderr, "[pot] sensitivity=%.2f\n", s);
+
+                        // activity: exp decay halflife 50ms→5000ms over 0–90%, hold above 90%
+                        float hl;
+                        if (norm >= 0.90f) {
+                            hl = 1e9f;
+                        } else {
+                            float t = norm / 0.90f;              // 0→1 over usable range
+                            hl = 50.0f * powf(100.0f, t);        // 50ms → 5000ms
+                        }
+                        activity_halflife_ms.store(hl, std::memory_order_relaxed);
+
+                        char buf[32];
+                        if (norm >= 0.90f)
+                            std::snprintf(buf, sizeof(buf), "%.1f / hold", s);
+                        else if (hl < 1000.f)
+                            std::snprintf(buf, sizeof(buf), "%.1f / %.0fms", s, hl);
+                        else
+                            std::snprintf(buf, sizeof(buf), "%.1f / %.1fs", s, hl / 1000.f);
+                        update_toast("sense/activity", buf);
+                        std::fprintf(stderr, "[pot] sensitivity=%.2f activity_hl=%.0fms\n", s, hl);
                     } else if (ch == 2) {
                         float ep = val / 1023.0f * 2.0f;
                         env_pos.store(ep, std::memory_order_relaxed);
                         const char* name = (ep < 0.75f) ? "percussive" : (ep < 1.25f) ? "sustained" : "swell";
-                        update_toast("envelope", name);
-                        std::fprintf(stderr, "[pot] env_pos=%.2f (%s)\n", ep, name);
+                        // mirror kEnvShapes interpolation to show real att/dec values
+                        static constexpr float kAtt[3] = {0.05f, 0.10f, 0.85f};
+                        static constexpr float kDec[3] = {0.95f, 0.10f, 0.15f};
+                        int lo = (ep >= 1.0f) ? 1 : 0;
+                        float t = ep - (float)lo;
+                        int att_pct = (int)((kAtt[lo] * (1.0f-t) + kAtt[lo+1] * t) * 100.0f + 0.5f);
+                        int dec_pct = (int)((kDec[lo] * (1.0f-t) + kDec[lo+1] * t) * 100.0f + 0.5f);
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "%s A:%d%% D:%d%%", name, att_pct, dec_pct);
+                        update_toast("envelope", buf);
+                        std::fprintf(stderr, "[pot] env_pos=%.2f (%s) att=%d%% dec=%d%%\n", ep, name, att_pct, dec_pct);
                     } else if (ch == 1) {
                         int ms = (int)(2000.0f * std::powf(15.0f / 2000.0f, val / 1023.0f));
                         grain_interval_ms.store(ms, std::memory_order_relaxed);
@@ -1228,8 +1516,8 @@ int main(int argc, char** argv) {
                         size_t n = 0;
                         if (store_a.mtx.try_lock()) { n += store_a.slices.size(); store_a.mtx.unlock(); }
                         if (store_b.mtx.try_lock()) { n += store_b.slices.size(); store_b.mtx.unlock(); }
-                        float max_k = std::max(2.0f, n * 0.5f);
-                        int k = std::max(1, (int)std::powf(max_k, val / 1023.0f));
+                        int k = std::max(1, (int)std::roundf(val / 1023.0f * 9.0f) + 1);
+                        if (k > 10) k = 10;
                         grain_k.store(k, std::memory_order_relaxed);
                         char buf[32]; std::snprintf(buf, sizeof(buf), "%d", k);
                         update_toast("grain neighbors", buf);
@@ -1267,13 +1555,6 @@ int main(int argc, char** argv) {
         close(out_req.fd);
         close(in_req.fd);
     });
-
-    // ---- input gain presets ----
-    static constexpr const char* kMixerCard      = "hw:2";
-    static constexpr float kGainLine_dB       =  0.0f;
-    static constexpr float kGainInstrument_dB = 40.0f;
-    static constexpr float kGainDualJack_dB   =  0.0f;
-    static constexpr float kGainMic_dB        = 30.0f;
 
     std::atomic<int> current_input_mode{-1};
 
@@ -1322,9 +1603,9 @@ int main(int argc, char** argv) {
 
                 float gain = kGainLine_dB;
                 switch (mode) {
-                    case 1: gain = kGainMic_dB;       break;
-                    case 2: gain = kGainDualJack_dB;  break;
-                    case 3: gain = kGainLine_dB;       break;
+                    case 1: gain = kGainMic_dB;      break;
+                    case 2: gain = kGainDualJack_dB; break;
+                    case 3: gain = trs_instrument_gain.load() ? kGainInstrument_dB : kGainLine_dB; break;
                 }
                 if (mode != 0) {
                     if (set_pga_gain_db(kMixerCard, gain))
@@ -1335,74 +1616,6 @@ int main(int argc, char** argv) {
                 current_input_mode.store(mode, std::memory_order_relaxed);
                 prev_mode = mode;
                 gain_settled_at = std::chrono::steady_clock::now();
-            }
-
-            auto now_sw = std::chrono::steady_clock::now();
-            if (current_input_mode.load(std::memory_order_relaxed) == 3) {
-                static constexpr float kLowRms        = 0.010f;
-                static constexpr float kHighRms       = 0.200f;
-                static constexpr int   kHoldMs        = 3000;
-                static constexpr int   kHighHoldMs    = 500;
-                static constexpr float kSignalPresent = 0.0005f;
-                static bool trs_instrument  = false;
-                static auto low_since       = std::chrono::steady_clock::time_point{};
-                static auto high_since      = std::chrono::steady_clock::time_point{};
-                static bool low_timing      = false;
-                static bool high_timing     = false;
-                static int  low_sig_count   = 0;
-
-                int pending = gain_change_pending.load(std::memory_order_relaxed);
-                if (pending != 0) {
-                    if (gain_confirm.exchange(false, std::memory_order_relaxed)) {
-                        if (pending == 1) {
-                            trs_instrument = true;
-                            mono_passthrough.store(true,  std::memory_order_relaxed);
-                            hpf_enabled.store(true,       std::memory_order_relaxed);
-                            set_pga_gain_db(kMixerCard, kGainInstrument_dB);
-                            gain_settled_at = now_sw;
-                            std::fprintf(stderr, "[gain] confirmed → instrument %.1fdB\n", kGainInstrument_dB);
-                        } else {
-                            trs_instrument = false;
-                            mono_passthrough.store(false, std::memory_order_relaxed);
-                            hpf_enabled.store(false,      std::memory_order_relaxed);
-                            set_pga_gain_db(kMixerCard, kGainLine_dB);
-                            gain_settled_at = now_sw;
-                            std::fprintf(stderr, "[gain] confirmed → line %.1fdB\n", kGainLine_dB);
-                        }
-                        gain_change_pending.store(0, std::memory_order_relaxed);
-                    } else if (gain_cancel.exchange(false, std::memory_order_relaxed)) {
-                        gain_change_pending.store(0, std::memory_order_relaxed);
-                        gain_settled_at = now_sw;
-                        low_timing = false; low_sig_count = 0;
-                        high_timing = false;
-                        std::fprintf(stderr, "[gain] cancelled — no change\n");
-                    }
-                }
-
-                bool settled = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now_sw - gain_settled_at).count() >= kSettleMs;
-                if (settled && pending == 0) {
-                    float rms = live_rms.load(std::memory_order_relaxed);
-                    if (!trs_instrument) {
-                        if (rms < kLowRms) {
-                            if (!low_timing) { low_since = now_sw; low_timing = true; low_sig_count = 0; }
-                            if (rms > kSignalPresent) low_sig_count++;
-                            if (low_sig_count >= 10 &&
-                                std::chrono::duration_cast<std::chrono::milliseconds>(now_sw - low_since).count() >= kHoldMs) {
-                                low_timing = false; low_sig_count = 0;
-                                gain_change_pending.store(1, std::memory_order_relaxed);
-                            }
-                        } else { low_timing = false; low_sig_count = 0; }
-                    } else {
-                        if (rms > kHighRms) {
-                            if (!high_timing) { high_since = now_sw; high_timing = true; }
-                            else if (std::chrono::duration_cast<std::chrono::milliseconds>(now_sw - high_since).count() >= kHighHoldMs) {
-                                high_timing = false;
-                                gain_change_pending.store(-1, std::memory_order_relaxed);
-                            }
-                        } else { high_timing = false; }
-                    }
-                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1432,15 +1645,12 @@ int main(int argc, char** argv) {
         }
         close(chip_fd);
 
-        int  last_signal   = new_slice_signal.load();
-        auto flash_until   = std::chrono::steady_clock::time_point{};
-        auto blink_tick    = std::chrono::steady_clock::now();
-        bool blink_state   = false;
+        int  last_signal = new_slice_signal.load();
+        auto flash_until = std::chrono::steady_clock::time_point{};
 
         while (g_run.load(std::memory_order_relaxed)) {
-            bool rec     = record_enabled.load(std::memory_order_relaxed);
-            bool pending = gain_change_pending.load(std::memory_order_relaxed) != 0;
-            auto now     = std::chrono::steady_clock::now();
+            bool rec = record_enabled.load(std::memory_order_relaxed);
+            auto now = std::chrono::steady_clock::now();
 
             int sig = new_slice_signal.load(std::memory_order_relaxed);
             if (sig != last_signal) {
@@ -1450,13 +1660,7 @@ int main(int argc, char** argv) {
 
             struct gpio_v2_line_values vals = {};
             vals.mask = 0b11;
-            if (pending) {
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - blink_tick).count() >= 250) {
-                    blink_state = !blink_state;
-                    blink_tick  = now;
-                }
-                vals.bits = blink_state ? 0b01 : 0b10;
-            } else if (now < flash_until) {
+            if (now < flash_until) {
                 vals.bits = 0b11;
             } else {
                 vals.bits = rec ? 0b01 : 0b10;
@@ -1513,12 +1717,21 @@ int main(int argc, char** argv) {
                     if (bank_menu_disp.page == 0) {
                         bank_menu_disp.open = false;
                         std::fprintf(stderr, "[menu] closed via mbtn\n");
+                    } else if ((bank_menu_disp.page == 1 || bank_menu_disp.page == 2)
+                               && !bank_menu_disp.file_list.empty()) {
+                        // mbtn on load list = delete confirmation for highlighted file
+                        int ci = bank_menu_disp.cursor;
+                        if (ci < (int)bank_menu_disp.file_list.size()) {
+                            std::strncpy(bank_menu_disp.delete_file,
+                                         bank_menu_disp.file_list[ci].c_str(),
+                                         sizeof(bank_menu_disp.delete_file) - 1);
+                            bank_menu_disp.page   = (bank_menu_disp.page == 1) ? 7 : 8;
+                            bank_menu_disp.cursor = 0;
+                        }
                     } else {
                         bank_menu_disp.page   = 0;
                         bank_menu_disp.cursor = 0;
                     }
-                } else {
-                    gain_cancel.store(true, std::memory_order_relaxed);
                 }
             }
 

@@ -13,17 +13,28 @@ GrainVisualizer::GrainVisualizer(SliceStore& store_a, SliceStore& store_b,
                                   std::atomic<bool>&  run,
                                   std::atomic<int>&   current_id,
                                   std::atomic<int>&   current_bank,
-                                  std::atomic<int>&   gain_pending,
                                   std::atomic<float>& crossfade,
                                   std::mutex&         bank_menu_mtx,
                                   BankMenuDisplay&    bank_menu_disp,
                                   std::mutex&         toast_mtx,
-                                  ParamToast&         toast_disp)
+                                  ParamToast&         toast_disp,
+                                  std::atomic<int>&   engine_mode,
+                                  std::atomic<float>& explore_x,
+                                  std::atomic<float>& explore_y,
+                                  std::atomic<float>& explore_z,
+                                  std::atomic<float>& search_radius,
+                                  std::atomic<float>& view_theta_y,
+                                  std::atomic<float>& view_theta_x,
+                                  std::atomic<float>& view_zoom)
     : store_a_(store_a), store_b_(store_b),
       run_(run), current_id_(current_id), current_bank_(current_bank),
-      gain_pending_(gain_pending), crossfade_(crossfade),
+      crossfade_(crossfade),
       bank_menu_mtx_(bank_menu_mtx), bank_menu_disp_(bank_menu_disp),
-      toast_mtx_(toast_mtx), toast_disp_(toast_disp) {}
+      toast_mtx_(toast_mtx), toast_disp_(toast_disp),
+      engine_mode_(engine_mode),
+      explore_x_(explore_x), explore_y_(explore_y), explore_z_(explore_z),
+      search_radius_(search_radius),
+      view_theta_y_(view_theta_y), view_theta_x_(view_theta_x), view_zoom_(view_zoom) {}
 
 void GrainVisualizer::start() {
     thread_ = std::thread(&GrainVisualizer::render_loop, this);
@@ -51,53 +62,67 @@ void GrainVisualizer::render_loop() {
         }
     }
 
-    // Try drivers in preference order: Wayland → kmsdrm → x11.
-    // If x11 fails and we're in an SSH session with a forwarded/mismatched DISPLAY,
-    // retry x11 with the local Xorg socket directly.
-    static const char* kDrivers[] = {"wayland", "kmsdrm", "x11", nullptr};
+    // Try drivers in preference order, with retries for service startup timing.
+    // kmsdrm is tried on both card0 and card1 (Pi 4/5 often uses card1 for HDMI).
+    // Retries handle the case where the DRM subsystem isn't ready at service start.
+    // The reinit label allows re-entry after persistent pageflip failures (wrong card).
+    reinit:
+    w_ = 800; h_ = 540;
     bool inited = false;
-    for (int i = 0; kDrivers[i]; ++i) {
-        SDL_SetHint(SDL_HINT_VIDEODRIVER, kDrivers[i]);
-        if (SDL_Init(SDL_INIT_VIDEO) == 0) {
-            std::fprintf(stderr, "[viz] SDL video driver: %s\n", kDrivers[i]);
-            inited = true;
-            break;
-        }
-        std::fprintf(stderr, "[viz] %s failed: %s\n", kDrivers[i], SDL_GetError());
-        SDL_Quit();
-    }
+    static constexpr int kMaxAttempts = 15;
+    for (int attempt = 0; attempt < kMaxAttempts && !inited && run_.load(); ++attempt) {
+        if (attempt > 0)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // Fallback: SSH X11 forwarding sets DISPLAY to a tunnel whose auth cookie
-    // hostname often doesn't match. If there's a local Xorg socket, point at it.
-    if (!inited) {
-        static const char* kLocalDisplays[] = {":0", ":1", nullptr};
-        for (int i = 0; kLocalDisplays[i] && !inited; ++i) {
-            char path[64];
-            std::snprintf(path, sizeof(path), "/tmp/.X11-unix/X%s", kLocalDisplays[i] + 1);
-            if (access(path, F_OK) != 0) continue;
-            setenv("DISPLAY", kLocalDisplays[i], 1);
-            if (!getenv("XAUTHORITY")) {
-                const char* home = getenv("HOME");
-                if (home) {
-                    char xauth[256];
-                    std::snprintf(xauth, sizeof(xauth), "%s/.Xauthority", home);
-                    if (access(xauth, F_OK) == 0)
-                        setenv("XAUTHORITY", xauth, 0);
-                }
-            }
+        // wayland
+        if (!inited) {
+            SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland");
+            if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+                std::fprintf(stderr, "[viz] SDL video driver: wayland\n");
+                inited = true;
+            } else { SDL_Quit(); }
+        }
+
+        // kmsdrm — try card index 0 then 1
+        for (int card = 0; card <= 1 && !inited; ++card) {
+            char idx[2] = {(char)('0' + card), '\0'};
+            SDL_SetHint(SDL_HINT_VIDEODRIVER, "kmsdrm");
+            SDL_SetHint("SDL_VIDEO_KMSDRM_DEVICE_INDEX", idx);
+            if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+                std::fprintf(stderr, "[viz] SDL video driver: kmsdrm (card%d)\n", card);
+                inited = true;
+            } else { SDL_Quit(); }
+        }
+
+        // x11 / local fallback
+        if (!inited) {
             SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");
             if (SDL_Init(SDL_INIT_VIDEO) == 0) {
-                std::fprintf(stderr, "[viz] SDL video driver: x11 (local fallback %s)\n", kLocalDisplays[i]);
+                std::fprintf(stderr, "[viz] SDL video driver: x11\n");
                 inited = true;
             } else {
-                std::fprintf(stderr, "[viz] x11 local fallback %s failed: %s\n", kLocalDisplays[i], SDL_GetError());
                 SDL_Quit();
+                static const char* kLocal[] = {":0", ":1", nullptr};
+                for (int i = 0; kLocal[i] && !inited; ++i) {
+                    char path[64];
+                    std::snprintf(path, sizeof(path), "/tmp/.X11-unix/X%s", kLocal[i] + 1);
+                    if (access(path, F_OK) != 0) continue;
+                    setenv("DISPLAY", kLocal[i], 1);
+                    SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");
+                    if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+                        std::fprintf(stderr, "[viz] SDL video driver: x11 (local %s)\n", kLocal[i]);
+                        inited = true;
+                    } else { SDL_Quit(); }
+                }
             }
         }
+
+        if (!inited && attempt == 0)
+            std::fprintf(stderr, "[viz] display not ready, retrying...\n");
     }
 
     if (!inited) {
-        std::fprintf(stderr, "[viz] no usable SDL video driver — visualizer disabled\n");
+        std::fprintf(stderr, "[viz] no usable SDL video driver after %d attempts — visualizer disabled\n", kMaxAttempts);
         return;
     }
 
@@ -130,6 +155,12 @@ void GrainVisualizer::render_loop() {
     scale_ = static_cast<float>(std::min(w_, h_)) / (kFocal / kCameraZ) * 0.45f;
     std::fprintf(stderr, "[viz] render size: %dx%d  scale: %.0f\n", w_, h_, scale_);
 
+    // If SDL opened a card but page-flipping fails (wrong DRM device), we detect it by
+    // measuring wall time: if 3 seconds pass and the loop is still running far faster
+    // than 30fps (because SDL_RenderPresent returns immediately on error), reinitialise.
+    auto init_time = steady_clock::now();
+    int  frame_count = 0;
+
     while (run_.load(std::memory_order_relaxed)) {
         auto t0 = steady_clock::now();
 
@@ -141,6 +172,20 @@ void GrainVisualizer::render_loop() {
         snapshot();
         render_frame();
         SDL_RenderPresent(renderer_);
+        frame_count++;
+
+        // detect pageflip failure: if we've rendered >150 frames in under 3s (>>30fps)
+        // the present is returning immediately rather than syncing to vsync
+        auto elapsed = duration<float>(steady_clock::now() - init_time).count();
+        if (elapsed > 3.0f && frame_count > 150 && (frame_count / elapsed) > 45.0f) {
+            std::fprintf(stderr, "[viz] pageflip failure detected (%.0f fps), trying other card\n",
+                         frame_count / elapsed);
+            SDL_DestroyRenderer(renderer_); renderer_ = nullptr;
+            SDL_DestroyWindow(window_);     window_   = nullptr;
+            SDL_Quit();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            goto reinit;
+        }
 
         auto dt = steady_clock::now() - t0;
         if (dt < milliseconds(33))
@@ -199,8 +244,18 @@ void GrainVisualizer::render_frame() {
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
 
-    float ty  = theta_y_;
-    float tx  = theta_x_;
+    int   mode = engine_mode_.load(std::memory_order_relaxed);
+    float ty, tx, zoom;
+    if (mode == 0) {
+        ty   = view_theta_y_.load(std::memory_order_relaxed);
+        tx   = view_theta_x_.load(std::memory_order_relaxed);
+        zoom = view_zoom_.load(std::memory_order_relaxed);
+    } else {
+        ty   = theta_y_;
+        tx   = theta_x_;
+        zoom = 2.0f;
+    }
+
     float cty = std::cos(ty), sty = std::sin(ty);
     float ctx = std::cos(tx), stx = std::sin(tx);
 
@@ -214,8 +269,8 @@ void GrainVisualizer::render_frame() {
         float denom = kCameraZ - zr;
         if (denom <= 0.01f) return false;
         float w = kFocal / denom;
-        sx = (int)(w_ / 2 + xr * w * scale_);
-        sy = (int)(h_ / 2 - yr * w * scale_);
+        sx = (int)(w_ / 2 + xr * w * scale_ * zoom);
+        sy = (int)(h_ / 2 - yr * w * scale_ * zoom);
         return true;
     };
 
@@ -257,7 +312,11 @@ void GrainVisualizer::render_frame() {
         }
     }
 
-    // draw grain points — bank A: blue→red, bank B: hue+120° (green→magenta)
+    // draw grain points — bank A: cyan, bank B: orange
+    // density-adaptive size: half=2 (5×5) when sparse, half=1 (3×3) medium, point when dense
+    int n_pts = (int)points_.size();
+    int grain_half = (n_pts < 80) ? 2 : (n_pts < 300) ? 1 : 0;
+
     int cur_id   = current_id_.load(std::memory_order_relaxed);
     int cur_bank = current_bank_.load(std::memory_order_relaxed);
     for (auto& p : points_) {
@@ -274,26 +333,23 @@ void GrainVisualizer::render_frame() {
             SDL_Rect rect = {sx - 3, sy - 3, 7, 7};
             SDL_RenderDrawRect(renderer_, &rect);
         } else if (p.flash > 0.0f) {
-            float base_hue = (1.0f - p.rolloff_norm) * (240.0f / 360.0f);
-            float hue = p.from_b ? std::fmod(base_hue + 0.333f, 1.0f) : base_hue;
-            float val = 0.3f + 0.7f * p.flatness_norm;
-            SDL_Color hue_col = hsv_to_rgb(hue, 0.9f, val);
+            uint8_t br = p.from_b ? 255 :   0;
+            uint8_t bg = p.from_b ? 150 : 200;
+            uint8_t bb = p.from_b ?   0 : 220;
             float t = p.flash;
-            uint8_t r = (uint8_t)(255 * t + hue_col.r * (1.0f - t));
-            uint8_t g = (uint8_t)(255 * t + hue_col.g * (1.0f - t));
-            uint8_t b = (uint8_t)(255 * t + hue_col.b * (1.0f - t));
-            SDL_SetRenderDrawColor(renderer_, r, g, b, 255);
+            SDL_SetRenderDrawColor(renderer_,
+                (uint8_t)(255 * t + br * (1.0f - t)),
+                (uint8_t)(255 * t + bg * (1.0f - t)),
+                (uint8_t)(255 * t + bb * (1.0f - t)), 255);
             int half = (int)(1.0f + 3.0f * t);
             SDL_Rect rect = {sx - half, sy - half, half * 2 + 1, half * 2 + 1};
             SDL_RenderFillRect(renderer_, &rect);
         } else {
-            float base_hue = (1.0f - p.rolloff_norm) * (240.0f / 360.0f);
-            float hue = p.from_b ? std::fmod(base_hue + 0.333f, 1.0f) : base_hue;
-            float val = 0.3f + 0.7f * p.flatness_norm;
-            SDL_Color col = hsv_to_rgb(hue, 0.9f, val);
-            SDL_SetRenderDrawColor(renderer_, col.r, col.g, col.b, 255);
-            if (zr > 0.1f) {
-                SDL_Rect rect = {sx - 1, sy - 1, 3, 3};
+            if (p.from_b) SDL_SetRenderDrawColor(renderer_, 255, 150,   0, 255);
+            else          SDL_SetRenderDrawColor(renderer_,   0, 200, 220, 255);
+            if (grain_half > 0) {
+                SDL_Rect rect = {sx - grain_half, sy - grain_half,
+                                 grain_half * 2 + 1, grain_half * 2 + 1};
                 SDL_RenderFillRect(renderer_, &rect);
             } else {
                 SDL_RenderDrawPoint(renderer_, sx, sy);
@@ -301,7 +357,53 @@ void GrainVisualizer::render_frame() {
         }
     }
 
-    theta_y_ += 0.004f;
+    if (mode == 1) theta_y_ += 0.004f;  // auto-rotate only in exploration mode
+
+    // exploration mode: centroid cursor + density-adaptive sphere
+    if (mode == 1) {
+        static constexpr float kPi = 3.14159265f;
+        float cx = explore_x_.load(std::memory_order_relaxed);
+        float cy = explore_y_.load(std::memory_order_relaxed);
+        float cz = explore_z_.load(std::memory_order_relaxed);
+        float r  = search_radius_.load(std::memory_order_relaxed);
+
+        float cxr, cyr, czr;
+        rotate(cx, cy, cz, cxr, cyr, czr);
+        int csx, csy;
+        if (project(cxr, cyr, czr, csx, csy)) {
+            // crosshair
+            SDL_SetRenderDrawColor(renderer_, 0, 255, 210, 255);
+            SDL_RenderDrawLine(renderer_, csx - 14, csy, csx + 14, csy);
+            SDL_RenderDrawLine(renderer_, csx, csy - 14, csx, csy + 14);
+            SDL_Rect dot = {csx - 3, csy - 3, 7, 7};
+            SDL_RenderDrawRect(renderer_, &dot);
+        }
+
+        if (r > 0.005f) {
+            static constexpr int kSteps = 48;
+            SDL_SetRenderDrawColor(renderer_, 0, 180, 160, 255);
+            // draw 3 great circles: XY, XZ, YZ planes
+            for (int plane = 0; plane < 3; plane++) {
+                int prev_sx = 0, prev_sy = 0;
+                bool prev_valid = false;
+                for (int s = 0; s <= kSteps; s++) {
+                    float angle = s * 2.0f * kPi / kSteps;
+                    float ca = std::cos(angle), sa = std::sin(angle);
+                    float px, py, pz;
+                    if      (plane == 0) { px = cx + r*ca; py = cy + r*sa; pz = cz; }
+                    else if (plane == 1) { px = cx + r*ca; py = cy;        pz = cz + r*sa; }
+                    else                 { px = cx;        py = cy + r*ca; pz = cz + r*sa; }
+                    float xr, yr, zr;
+                    rotate(px, py, pz, xr, yr, zr);
+                    int sx, sy;
+                    bool valid = project(xr, yr, zr, sx, sy);
+                    if (valid && prev_valid)
+                        SDL_RenderDrawLine(renderer_, prev_sx, prev_sy, sx, sy);
+                    prev_sx = sx; prev_sy = sy; prev_valid = valid;
+                }
+            }
+        }
+    }
 
     // crossfader bar (always visible at bottom)
     {
@@ -327,24 +429,32 @@ void GrainVisualizer::render_frame() {
         }
     }
 
-    // gain-change prompt overlay
-    int pending = gain_pending_.load(std::memory_order_relaxed);
-    if (pending != 0 && font_) {
-        const int kBarH = 52;
-        const int kPad  = 8;
-
-        SDL_SetRenderDrawColor(renderer_, 180, 120, 0, 255);
-        SDL_Rect bar = {0, h_ - kBarH, w_, kBarH};
-        SDL_RenderFillRect(renderer_, &bar);
-
-        SDL_Color white  = {255, 255, 255, 255};
-        SDL_Color green  = { 80, 220,  80, 255};
-        SDL_Color red    = {220,  80,  80, 255};
-
-        const char* action = (pending == 1) ? "Switch to INSTRUMENT gain?" : "Switch to LINE gain?";
-        draw_text(action,           kPad,           h_ - kBarH + kPad,      white);
-        draw_text("Enc4 = confirm", kPad,           h_ - kBarH + kPad + 26, green);
-        draw_text("MBtn = cancel",  w_ / 2 + kPad,  h_ - kBarH + kPad + 26, red);
+    // axis legend (top-left)
+    if (font_) {
+        struct LegendEntry { uint8_t r, g, b; const char* label; bool square; };
+        static const LegendEntry kLegend[] = {
+            {  0, 200, 220, "A  bank A", true},
+            {255, 150,   0, "B  bank B", true},
+            {255,  80,  80, "X  tonal",  false},
+            { 80, 255,  80, "Y  rolloff",false},
+            { 80,  80, 255, "Z  rms",    false},
+        };
+        int lx = 12, ly = 10;
+        for (int i = 0; i < 5; i++) {
+            if (i == 2) ly += 8;  // gap between banks and axes
+            const auto& e = kLegend[i];
+            SDL_SetRenderDrawColor(renderer_, e.r, e.g, e.b, 255);
+            if (e.square) {
+                SDL_Rect swatch = {lx + 2, ly + 5, 12, 12};
+                SDL_RenderFillRect(renderer_, &swatch);
+            } else {
+                SDL_Rect swatch = {lx, ly + 8, 20, 4};
+                SDL_RenderFillRect(renderer_, &swatch);
+            }
+            SDL_Color col = {e.r, e.g, e.b, 255};
+            draw_text(e.label, lx + 28, ly, col);
+            ly += 26;
+        }
     }
 
     // bank menu overlay
@@ -365,9 +475,12 @@ void GrainVisualizer::render_frame() {
 
             // count items for height
             int n_items = 0;
-            if (snap.page == 0) n_items = 10;
+            if (snap.page == 0) n_items = 13;
             else if (snap.page == 1 || snap.page == 2)
                 n_items = (int)snap.file_list.size() + (snap.file_list.empty() ? 1 : 0);
+            else if (snap.page == 5 || snap.page == 6) n_items = 2;
+            else if (snap.page == 7 || snap.page == 8) n_items = 3;
+            else if (snap.page == 9) n_items = 3;
             else n_items = 2;  // ConfirmClear
 
             int panel_h = kPad + kLineH + 4 + n_items * kLineH + kLineH + kPad;
@@ -391,9 +504,17 @@ void GrainVisualizer::render_frame() {
 
                 std::string name_a = snap.bank_name_a.empty() ? "<empty>" : snap.bank_name_a;
                 std::string name_b = snap.bank_name_b.empty() ? "<empty>" : snap.bank_name_b;
+                if (snap.has_file_a) name_a += "  [↩ overwrite]";
+                if (snap.has_file_b) name_b += "  [↩ overwrite]";
                 std::string rec_toggle = std::string("Record -> ") +
                     (snap.record_target == 0 ? "B (currently A)" : "A (currently B)");
-                const std::string items[10] = {
+                int cur_mode = engine_mode_.load(std::memory_order_relaxed);
+                std::string mode_item = std::string("Mode: ") +
+                    (cur_mode == 0 ? "Analysis  [→ Exploration]" : "Exploration  [→ Analysis]");
+                std::string gain_item = snap.trs_instrument
+                    ? "Gain: INSTRUMENT  [→ Line]"
+                    : "Gain: LINE  [→ Instrument]";
+                const std::string items[13] = {
                     "Slot A: " + name_a,
                     "Slot B: " + name_b,
                     "Load -> A",
@@ -403,16 +524,20 @@ void GrainVisualizer::render_frame() {
                     "Clear A",
                     "Clear B",
                     rec_toggle,
+                    gain_item,
+                    mode_item,
+                    "Shutdown",
                     "Exit"
                 };
-                for (int i = 0; i < 10; i++) {
+                for (int i = 0; i < 13; i++) {
                     bool selected = (i == snap.cursor);
                     if (selected) {
                         SDL_SetRenderDrawColor(renderer_, 60, 55, 0, 255);
                         SDL_Rect hl = {kPanelX - 4, y - 2, kPanelW + 8, kLineH};
                         SDL_RenderFillRect(renderer_, &hl);
                     }
-                    SDL_Color col = selected ? yellow : (i < 2 ? gray : white);
+                    bool slot_item = (i == 0 && snap.has_file_a) || (i == 1 && snap.has_file_b);
+                    SDL_Color col = selected ? yellow : (i < 2 && !slot_item ? gray : white);
                     draw_text(items[i].c_str(), kPanelX, y, col);
                     y += kLineH;
                 }
@@ -433,7 +558,43 @@ void GrainVisualizer::render_frame() {
                         draw_text(snap.file_list[i].c_str(), kPanelX, y, col);
                         y += kLineH;
                     }
+                    draw_text("btn=load  M=delete", kPanelX, y + 4, gray); y += kLineH;
                 }
+            } else if (snap.page == 9) {
+                draw_text("POWER OFF?", kPanelX, y, red); y += kLineH + 4;
+                draw_text("Enc4 = confirm shutdown", kPanelX, y, green); y += kLineH;
+                draw_text("MBtn = cancel",           kPanelX, y, gray);  y += kLineH;
+            } else if (snap.page == 7 || snap.page == 8) {
+                const char* title = (snap.page == 7) ? "DELETE FILE?" : "DELETE FILE?";
+                draw_text(title, kPanelX, y, red); y += kLineH + 4;
+                draw_text(snap.delete_file, kPanelX, y, white); y += kLineH;
+                draw_text("Enc4 = confirm delete", kPanelX, y, green); y += kLineH;
+                draw_text("MBtn = cancel",         kPanelX, y, gray);  y += kLineH;
+            } else if (snap.page == 5 || snap.page == 6) {
+                const char* title = (snap.page == 5) ? "SAVE A AS:" : "SAVE B AS:";
+                draw_text(title, kPanelX, y, yellow); y += kLineH + 4;
+
+                // draw 12 character cells
+                static constexpr int kCellW = 22, kCellH = 28;
+                int cx = kPanelX;
+                for (int ci = 0; ci < 12; ci++) {
+                    bool cur = (ci == snap.cursor);
+                    if (cur) {
+                        SDL_SetRenderDrawColor(renderer_, 70, 60, 0, 255);
+                        SDL_Rect bg = {cx, y, kCellW, kCellH};
+                        SDL_RenderFillRect(renderer_, &bg);
+                    }
+                    SDL_SetRenderDrawColor(renderer_, cur ? 255 : 100, cur ? 220 : 100, 0, 255);
+                    SDL_Rect border = {cx, y, kCellW, kCellH};
+                    SDL_RenderDrawRect(renderer_, &border);
+                    char ch[2] = {snap.name_buf[ci] ? snap.name_buf[ci] : ' ', '\0'};
+                    SDL_Color cc = cur ? yellow : white;
+                    draw_text(ch, cx + 4, y + 4, cc);
+                    cx += kCellW + 2;
+                }
+                y += kCellH + 6;
+                draw_text("enc4=char  btn=next  last=save  M=back", kPanelX, y, gray);
+                y += kLineH;
             } else {
                 const char* title = (snap.page == 3) ? "CLEAR SLOT A?" : "CLEAR SLOT B?";
                 draw_text(title, kPanelX, y, yellow); y += kLineH + 4;
